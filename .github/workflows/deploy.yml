@@ -1,0 +1,95 @@
+name: Deploy
+
+# Publishes https://demo.obzly.com: the demo built on the latest Obzly
+# release. Runs on every push to main, and daily to pick up a new Obzly
+# release (it skips the build when the live site is already current).
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "47 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Check out the demo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: demo
+          persist-credentials: false
+
+      - name: Pick the Obzly release
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          ref="$(demo/scripts/latest-release.sh)"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          want="$(printf 'obzly %s\ndemo %s' "$ref" "$(git -C demo rev-parse HEAD)")"
+          live="$(curl -fsSL https://demo.obzly.com/demo-version.txt || true)"
+          if [ "$EVENT" = schedule ] && [ "$live" = "$want" ]; then
+            echo "demo.obzly.com already runs Obzly $ref with this demo."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out Obzly
+        if: steps.plan.outputs.publish == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: obzly/obzly
+          ref: ${{ steps.plan.outputs.ref }}
+          path: obzly
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: steps.plan.outputs.publish == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "26.13.0"
+          cache: "npm"
+          cache-dependency-path: obzly/frontend/package-lock.json
+
+      - name: Check and build
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          REF: ${{ steps.plan.outputs.ref }}
+        run: |
+          set -euo pipefail
+          (cd obzly/frontend && npm ci --no-audit --no-fund)
+          demo/scripts/check.sh obzly
+          demo/scripts/build.sh obzly "$REF"
+
+      - name: Upload the site
+        if: steps.plan.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: obzly/frontend/dist
+
+  deploy:
+    needs: [build]
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

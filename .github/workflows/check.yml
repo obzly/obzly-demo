@@ -1,0 +1,92 @@
+name: Check
+
+# Type checks, lints, tests and builds the demo against the latest Obzly
+# release (what demo.obzly.com runs) and against Obzly's main branch, so a UI
+# change the demo doesn't answer yet shows up before it is released. The daily
+# run opens an issue when either fails.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check (Obzly ${{ matrix.obzly }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        obzly: [release, main]
+    steps:
+      - name: Check out the demo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: demo
+          persist-credentials: false
+
+      - name: Pick the Obzly version
+        id: obzly
+        env:
+          WHICH: ${{ matrix.obzly }}
+        run: |
+          set -euo pipefail
+          if [ "$WHICH" = release ]; then ref="$(demo/scripts/latest-release.sh)"; else ref=main; fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Obzly
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: obzly/obzly
+          ref: ${{ steps.obzly.outputs.ref }}
+          path: obzly
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "26.13.0"
+          cache: "npm"
+          cache-dependency-path: obzly/frontend/package-lock.json
+
+      - name: Install the app's dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: obzly/frontend
+
+      - name: Check
+        run: demo/scripts/check.sh obzly
+
+      - name: Build
+        env:
+          REF: ${{ steps.obzly.outputs.ref }}
+        run: demo/scripts/build.sh obzly "$REF"
+
+  report:
+    name: Report a failed daily check
+    needs: [check]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue (once)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Daily demo check failed"
+          open="$(gh issue list --state open --search "in:title \"$title\"" --json number --jq 'length')"
+          if [ "$open" = 0 ]; then
+            gh issue create --title "$title" --body "The demo no longer passes against the latest Obzly release or Obzly main: $RUN_URL
+
+          Usually the UI calls an API the demo doesn't answer yet; \`src/coverage.test.ts\` lists which. Add a handler in \`src/handlers/\`, or a \`notInDemo()\` stub."
+          else
+            echo "An issue is already open."
+          fi
