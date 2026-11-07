@@ -5,8 +5,8 @@ import { mountDemoBanner } from './DemoBanner';
 import { buildRouter } from './handlers';
 import { json } from './lib/http';
 import { DemoError, type DemoRequest } from './router';
+import { prefillSignIn } from './signInPrefill';
 import { resetDemo } from './store';
-import { DEMO_TOKEN, DEMO_USER_ID } from './world';
 
 const router = buildRouter();
 const realFetch = window.fetch.bind(window);
@@ -63,26 +63,17 @@ async function demoFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 }
 
-function signIn() {
-  try {
-    localStorage.setItem('obzly_user_token', DEMO_TOKEN);
-    localStorage.setItem('obzly_user_id', DEMO_USER_ID);
-  } catch {
-    /* blocked storage: the app then shows sign-in, which also works */
-  }
-}
-
-/** Sign out = start the demo over. */
+/** "Reset demo": undo the visitor's changes; a signed-in visitor stays signed in. */
 export function restartDemo() {
   resetDemo();
-  signIn();
   window.location.reload();
 }
 
+// Visitors start on the app's sign-in page; signInPrefill fills it in.
 export function installDemo() {
   window.fetch = demoFetch;
-  signIn();
   mountDemoBanner();
+  prefillSignIn();
 }
 
 installDemo();

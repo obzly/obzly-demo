@@ -21,6 +21,9 @@ repository's `src/` as `frontend/src/demo`, and starts the app from `src/entry.t
   Nothing is sent anywhere.
 - SQL mode runs a real DuckDB (WebAssembly, downloaded the first time it's used). PromQL is a
   built-in subset (`src/query/`).
+- Visitors start on the app's real sign-in page. `src/signInPrefill.ts` fills in the demo account
+  with a random password, then a random code on the two-factor step; any password and any
+  6-digit code work. Signing out goes back there.
 - SSO, sending email and cloud credential tests answer "not available in the demo".
 
 All names, hosts and addresses in the sample data are fictional (`*.example.com`, documentation IP

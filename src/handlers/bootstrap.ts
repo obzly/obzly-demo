@@ -27,6 +27,9 @@ const daysAgo = (days: number) => new Date(Date.now() - days * DAY).toISOString(
 /** MFA on the demo user's account (admin.ts's MFA setup changes it). */
 const demoUserMfa = () => users.get(DEMO_USER_ID)?.mfaEnabled ?? true;
 
+/** The sign-in MFA challenge; not a secret, the demo accepts any 6-digit code. */
+export const DEMO_MFA_CHALLENGE = 'demo-mfa-challenge';
+
 export const currentUser = (): UserProfile => ({
   ...DEMO_USER,
   role: 'ADMIN' as UserProfile['role'],
@@ -172,9 +175,14 @@ export function register(r: Router) {
     satisfiedByIdentityProvider: false,
   }));
   r.get('/users/is-any-user-exist', () => ({ isExist: true }));
-  r.get('/users/admin/has-password', () => ({ hasPassword: true }));
-  // Any credentials sign in as the demo user.
-  r.post('/users/signin', () => ({ token: DEMO_TOKEN, userId: DEMO_USER_ID }));
+  r.get('/users/admin/has-password', () => ({ hasPassword: true, isRegistrationEnabled: false }));
+  // Any email and password sign in as the demo user. With MFA on (the seed)
+  // the app asks for a code next, which admin.ts's login-verify accepts.
+  r.post('/users/signin', () =>
+    demoUserMfa()
+      ? { mfaRequired: true, mfaToken: DEMO_MFA_CHALLENGE }
+      : { token: DEMO_TOKEN, userId: DEMO_USER_ID, email: currentUser().email },
+  );
   r.post('/users/logout', () => ({ message: 'Signed out' }));
   r.put('/users/change-password', () => ({
     message: 'Password changed (demo: nothing was stored)',

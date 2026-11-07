@@ -11,6 +11,7 @@ import type {
   ListUsersResponse,
   OAuthConnectedApp,
   SSOConnector,
+  SignInResponse,
   UserProfile,
 } from '../../entity/users';
 import { DemoError } from '../router';
@@ -175,6 +176,31 @@ describe('demo admin area', () => {
       { apiKeyIds: [created.id] },
     );
     expect(bulk.deletedCount).toBe(1);
+  });
+
+  it('signs in with any credentials, then any 6-digit code', async () => {
+    const signIn = { email: 'alex.rivera@harborline.example.com', password: 'Xk3m9qrt7wze-42' };
+    const first = await call<SignInResponse>(router, 'POST', '/users/signin', signIn);
+    expect(first).toMatchObject({ mfaRequired: true });
+    expect(first.token).toBeUndefined();
+    expect(first.mfaToken).toBeTruthy();
+
+    const body = (code: string) => ({ mfaToken: first.mfaToken, code });
+    await rejects(call(router, 'POST', '/users/mfa/login-verify', body('12345')), 400);
+    const verified = await call<SignInResponse>(
+      router,
+      'POST',
+      '/users/mfa/login-verify',
+      body('482913'),
+    );
+    expect(verified).toMatchObject({ userId: DEMO_USER_ID });
+    expect(verified.token).toBeTruthy();
+
+    // With MFA turned off in the profile, sign-in skips the code.
+    await call(router, 'POST', '/users/mfa/disable', { code: '123456' });
+    const direct = await call<SignInResponse>(router, 'POST', '/users/signin', signIn);
+    expect(direct.token).toBeTruthy();
+    expect(direct.mfaRequired).toBeUndefined();
   });
 
   it('access tokens, connected apps, MFA and SSO', async () => {
