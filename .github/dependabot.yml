@@ -1,0 +1,14 @@
+# Keeps the workflows' SHA-pinned actions current. The app's own npm
+# dependencies are Obzly's (obzly/obzly); DuckDB's version is pinned in
+# scripts/setup.sh.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: CHORE
