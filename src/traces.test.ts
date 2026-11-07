@@ -298,14 +298,19 @@ describe('correlation', () => {
     expect(linked[0].serviceName).toBe('checkout');
     expect(linked[0].triggerSummary).toContain('payments');
 
+    // The busiest window: the newest can be the tail end of an incident,
+    // with a handful of errors and none of the pool-exhausted logs yet.
+    const errorLogs = (s: Session) =>
+      Number(/(\d+) error log/.exec(s.triggerSummary ?? '')?.[1] ?? 0);
+    const busiest = linked.reduce((a, b) => (errorLogs(b) > errorLogs(a) ? b : a));
     const detail = await call<SessionDetail>(
       'GET',
-      `/correlation/sessions/${PROJECT_ID}/${linked[0].id}`,
+      `/correlation/sessions/${PROJECT_ID}/${busiest.id}`,
     );
-    expect(detail.session).toEqual(linked[0]);
+    expect(detail.session).toEqual(busiest);
     const logs = detail.signals.filter((s) => s.signalType === 'log').length;
     const spans = detail.signals.filter((s) => s.signalType === 'span').length;
-    expect(linked[0].triggerSummary).toContain(`${logs} error log(s), ${spans} error span(s)`);
+    expect(busiest.triggerSummary).toContain(`${logs} error log(s), ${spans} error span(s)`);
     expect(detail.signals.some((s) => s.log?.message.includes('HikariPool-1'))).toBe(true);
 
     // Repeat reads are cached and identical.
