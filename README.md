@@ -4,10 +4,14 @@
 UI in your browser, with sample data and no server. Anything you create or change stays in your
 browser; "Reset demo" puts it back.
 
-This repository holds only the demo. The app is the unchanged Obzly frontend from the latest
-release: the build checks out [obzly/obzly](https://github.com/obzly/obzly) at that tag, adds this
-repository's `src/` as `frontend/src/demo`, and starts the app from `src/entry.ts` instead of
-`main.tsx`.
+This repository, [obzly/obzly-demo](https://github.com/obzly/obzly-demo), holds only the demo. The
+app is the unchanged Obzly frontend from the latest release: the build checks out
+[obzly/obzly](https://github.com/obzly/obzly) at that tag, adds this repository's `src/` as
+`frontend/src/demo`, and starts the app from `src/entry.ts` instead of `main.tsx`. Obzly itself
+contains no demo code.
+
+Found a problem with the demo? [Open an issue here](https://github.com/obzly/obzly-demo/issues).
+For a problem in Obzly itself, use [obzly/obzly](https://github.com/obzly/obzly/issues).
 
 ## How it works
 
@@ -21,6 +25,9 @@ repository's `src/` as `frontend/src/demo`, and starts the app from `src/entry.t
   Nothing is sent anywhere.
 - SQL mode runs a real DuckDB (WebAssembly, downloaded the first time it's used). PromQL is a
   built-in subset (`src/query/`).
+- Visitors start on the app's real sign-in page. `src/signInPrefill.ts` fills in the demo account
+  with a random password, then a random code on the two-factor step; any password and any
+  6-digit code work. Signing out goes back there.
 - SSO, sending email and cloud credential tests answer "not available in the demo".
 
 All names, hosts and addresses in the sample data are fictional (`*.example.com`, documentation IP
@@ -28,19 +35,28 @@ ranges).
 
 ## Run it locally
 
-You need Node.js and a checkout of Obzly next to this one:
+You need Node.js, and this repository and Obzly checked out side by side:
 
 ```bash
-git clone https://github.com/obzly/obzly.git ../obzly
+git clone https://github.com/obzly/obzly-demo.git
 ```
 
 ```bash
-(cd ../obzly/frontend && npm ci)
+git clone https://github.com/obzly/obzly.git
 ```
+
+```bash
+(cd obzly/frontend && npm ci)
+```
+
+Then, from `obzly-demo`:
 
 ```bash
 scripts/dev.sh ../obzly
 ```
+
+It opens on the sign-in page with the demo account and a two-factor code filled in, so
+click Sign in, then Verify.
 
 `dev.sh` links `src/` into the checkout, so edits here reload in the browser. It also copies
 `build/vite.demo.config.ts` and `build/.env.demo` into `frontend/` and installs DuckDB there
@@ -63,8 +79,11 @@ builds the site into `../obzly/frontend/dist`.
 - The **Check** workflow runs on every pull request and daily, against both the latest Obzly
   release and Obzly's main branch. A failed daily run opens an issue, so a breaking UI change is
   found before it is released.
-- The **Deploy** workflow publishes to GitHub Pages on every push to main, and daily when there is
-  a new Obzly release.
+- The **Deploy** workflow publishes to GitHub Pages (custom domain `demo.obzly.com`) on every push
+  to main, and daily when there is a new Obzly release. `demo.obzly.com/demo-version.txt` shows
+  which Obzly release and demo commit are live.
+- `main` is protected: changes go through a pull request, and both Check runs and CodeQL must
+  pass.
 
 ## License
 
