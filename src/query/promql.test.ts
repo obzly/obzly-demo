@@ -691,7 +691,9 @@ describe('performance', () => {
     return { response, ms: performance.now() - started };
   };
 
-  it('answers 24 h range queries over ~50 series well under 150 ms', () => {
+  // About 50 ms each on a laptop. The limits leave room for slow CI runners
+  // and still catch a query that has gone quadratic.
+  it('answers 24 h range queries over ~50 series quickly', () => {
     const queries = [
       'sum by (k8s_pod_name) (rate(k8s_pod_network_io[5m]))',
       'histogram_quantile(0.99, sum by (le, service_name) (rate(http_server_request_duration_bucket[5m])))',
@@ -702,10 +704,10 @@ describe('performance', () => {
     for (const query of queries) {
       const { response, ms } = timed(query);
       expect(response.series.length, query).toBeGreaterThan(0);
-      expect(ms, query).toBeLessThan(150);
+      expect(ms, query).toBeLessThan(600);
     }
     const fine = timed('sum by (service_name) (rate(http_server_request_duration_count[5m]))', 60);
     expect(fine.response.series[0].points.length).toBe(1441);
-    expect(fine.ms).toBeLessThan(300);
+    expect(fine.ms).toBeLessThan(1200);
   });
 });
