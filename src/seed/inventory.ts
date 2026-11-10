@@ -2,7 +2,14 @@
 // (the EKS cluster's nodes, the batch VM, load balancers, RDS, S3, Lambda)
 // and the analytics team's Azure subscription in West Europe. Account ids,
 // subscription GUIDs, ARNs and names are all made up.
-import type { CloudAccess, CloudProvider, CloudScope, CloudUse } from '../../entity/cloud';
+import type {
+  CloudAccess,
+  CloudProvider,
+  CloudScope,
+  CloudUse,
+  CostSettings,
+  PostureSettings,
+} from '../../entity/cloud';
 import { hashString, hex, uuidFrom } from '../lib/rng';
 import { collection } from '../store';
 import { BATCH_HOST, CLUSTER, DEMO_USER_ID, NODES, REGION } from '../world';
@@ -36,6 +43,9 @@ export interface StoredConnection {
   resourceTypes: string[];
   intervalSeconds: number;
   healthIntervalSeconds: number;
+  /** Set when scanTypes has cost / posture. */
+  cost?: CostSettings;
+  posture?: PostureSettings;
   enabled: boolean;
   version: number;
   createdBy?: string;
@@ -61,7 +71,15 @@ const connectionSeed = (): StoredConnection[] => [
     tenantId: '',
     probeId: uuidFrom('probe:aws-eu-west-1'),
     destinationId: PROD_DESTINATION_ID,
-    scanTypes: ['inventory'],
+    scanTypes: ['inventory', 'cost', 'posture'],
+    cost: {
+      source: 'export',
+      scope: 'account',
+      export: { bucket: 'harborline-billing-exports', region: REGION, prefix: 'focus/harborline' },
+      refreshHours: 12,
+      trackedTags: ['team', 'env'],
+    },
+    posture: { source: 'auto', refreshHours: 12 },
     regions: [REGION, 'us-east-1'],
     resourceTypes: [],
     intervalSeconds: 14_400,
@@ -85,7 +103,9 @@ const connectionSeed = (): StoredConnection[] => [
     tenantId: AZURE_TENANT,
     probeId: uuidFrom('probe:aws-eu-west-1'),
     destinationId: STAGING_DESTINATION_ID,
-    scanTypes: ['inventory'],
+    scanTypes: ['inventory', 'cost', 'posture'],
+    cost: { source: 'api', scope: 'account', refreshHours: 12, trackedTags: ['team', 'env'] },
+    posture: { source: 'auto', refreshHours: 12 },
     regions: [AZURE_REGION],
     resourceTypes: [],
     intervalSeconds: 14_400,

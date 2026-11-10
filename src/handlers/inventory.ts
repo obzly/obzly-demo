@@ -4,9 +4,12 @@
 import type {
   CloudConnection,
   CloudConnectionRequest,
+  CloudCostSettings,
   CloudScan,
   CloudSetup,
   CloudTest,
+  CostSettings,
+  PostureSettings,
   UseResult,
 } from '../../entity/cloud';
 import type { Asset, AssetDetail } from '../../entity/inventory';
@@ -29,8 +32,8 @@ import {
   cloudResources,
 } from '../seed/inventory';
 import { destinations, probes } from '../seed/synthetics';
-import { newId } from '../store';
-import { DEMO_USER_ID } from '../world';
+import { newId, value } from '../store';
+import { DEMO_USER_ID, REGION } from '../world';
 import { probeView } from './synthetics';
 
 const HOUR = 3_600_000;
@@ -151,8 +154,10 @@ function connectionFrom(
   if (health > interval) bad("health scans can't be less frequent than discovery");
   const scanTypes = [...new Set(request.scanTypes ?? [])];
   if (!scanTypes.length) bad('pick at least one scan type');
-  const later = scanTypes.find((use) => use !== 'inventory');
-  if (later) bad(`the ${later} scan comes in a later release`);
+  const unknown = scanTypes.find((use) => !['inventory', 'cost', 'posture'].includes(use));
+  if (unknown) bad(`unknown use "${unknown}"`);
+  const cost = scanTypes.includes('cost') ? costFrom(request.cost) : undefined;
+  const posture = scanTypes.includes('posture') ? postureFrom(request.posture) : undefined;
   const scopeId = (request.scopeId ?? '').trim();
   let identity = (request.identity ?? '').trim();
   let tenantId = (request.tenantId ?? '').trim().toLowerCase();
@@ -230,6 +235,8 @@ function connectionFrom(
     resourceTypes,
     intervalSeconds: interval,
     healthIntervalSeconds: health,
+    cost,
+    posture,
     enabled: request.enabled ?? true,
     version: existing ? existing.version + 1 : 1,
     createdBy: existing?.createdBy ?? DEMO_USER_ID,
@@ -238,6 +245,45 @@ function connectionFrom(
     seeded: existing?.seeded,
   };
 }
+
+/** Validates the cost use's choices like the control plane's costSettingsFrom. */
+function costFrom(settings?: CostSettings): CostSettings {
+  if (!settings) return bad('the cost use needs its settings');
+  if (!['auto', 'export', 'api'].includes(settings.source)) {
+    bad('the cost source is auto, export or api');
+  }
+  if (!['account', 'billing', 'via'].includes(settings.scope)) {
+    bad('the billing scope is account, billing or via');
+  }
+  if (settings.scope === 'via' && !cloudConnections.get(settings.viaConnectionId ?? '')) {
+    bad("pick the connection that reads this one's cost");
+  }
+  const hours = settings.refreshHours || 12;
+  if (hours < 6 || hours > 24) bad('cost refreshes every 6 to 24 hours');
+  return {
+    source: settings.source,
+    scope: settings.scope,
+    viaConnectionId: settings.scope === 'via' ? settings.viaConnectionId : undefined,
+    export: settings.source === 'api' ? undefined : settings.export,
+    refreshHours: hours,
+    trackedTags: costSettings.get().trackedTags,
+  };
+}
+
+function postureFrom(settings?: PostureSettings): PostureSettings {
+  const source = settings?.source ?? 'auto';
+  if (!['auto', 'native', 'baseline'].includes(source)) {
+    bad('the posture source is auto, native or baseline');
+  }
+  const hours = settings?.refreshHours || 12;
+  if (hours < 4 || hours > 24) bad('posture refreshes every 4 to 24 hours');
+  return { source, refreshHours: hours };
+}
+
+/** The tag keys cost keeps on its rows, for every connection. */
+const costSettings = value<CloudCostSettings>('cloud.costSettings', () => ({
+  trackedTags: ['team', 'env'],
+}));
 
 /** How the seeded scans go: AWS fine (a little throttled), Azure missing one permission. */
 function scanUse(connection: Pick<StoredConnection, 'provider' | 'scopeId'>): UseResult {
@@ -307,9 +353,52 @@ function statusOf(connection: StoredConnection, now: number): CloudConnection['s
     startedAt: new Date(healthAt).toISOString(),
     durationSeconds: aws ? 6.2 : 3.1,
   };
+  const ok = { state: 'ok' as const };
+  const costAt = Math.floor(now / (12 * HOUR)) * 12 * HOUR + 7 * 60_000;
+  const month = new Date(now).toISOString().slice(0, 7);
+  const cost: CloudScan | undefined = connection.cost && {
+    kind: 'cost',
+    uses: { cost: ok },
+    resources: 0,
+    probe: member,
+    startedAt: new Date(costAt > now ? costAt - 12 * HOUR : costAt).toISOString(),
+    durationSeconds: aws ? 18.4 : 9.6,
+    cost: aws
+      ? {
+          source: 'export',
+          finalThrough: new Date(now - 2 * DAY).toISOString().slice(0, 10),
+          rows: 1_184,
+          lastFile: `focus/harborline/data/BILLING_PERIOD=${month}/harborline-00001.snappy.parquet`,
+          lastFileAt: new Date(now - 9 * HOUR).toISOString(),
+        }
+      : {
+          source: 'api',
+          finalThrough: new Date(now - 2 * DAY).toISOString().slice(0, 10),
+          rows: 36,
+          requests: 2,
+        },
+  };
+  const postureAt = Math.floor(now / (12 * HOUR)) * 12 * HOUR + 19 * 60_000;
+  const posture: CloudScan | undefined = connection.posture && {
+    kind: 'posture',
+    uses: { posture: ok },
+    resources: 0,
+    probe: member,
+    startedAt: new Date(postureAt > now ? postureAt - 12 * HOUR : postureAt).toISOString(),
+    durationSeconds: aws ? 27.1 : 6.8,
+    posture: aws
+      ? {
+          findings: 9,
+          native: [`${AWS_ACCOUNT}/${REGION}`],
+          baseline: [`${AWS_ACCOUNT}/us-east-1`],
+        }
+      : { findings: 3, baseline: [`${AZURE_SUBSCRIPTION}/global`] },
+  };
   return {
     scan,
     health,
+    cost,
+    posture,
     reportedAt: new Date(healthAt + health.durationSeconds * 1000 + 800).toISOString(),
   };
 }
@@ -451,6 +540,16 @@ export function register(r: Router) {
   );
   r.post('/cloud-connections/test', (req) => startCloudTest(body<CloudConnectionRequest>(req)));
   r.get('/cloud-connections/tests/:id', (req) => cloudTest(req.params.id));
+  r.get('/cloud-connections/cost-settings', () => costSettings.get());
+  r.put('/cloud-connections/cost-settings', (req) => {
+    const tags = [
+      ...new Set(
+        (body<CloudCostSettings>(req).trackedTags ?? []).map((t) => t.trim()).filter(Boolean),
+      ),
+    ];
+    if (tags.length > 10) bad('track at most 10 tags');
+    return costSettings.set({ trackedTags: tags });
+  });
   r.get('/cloud-connections/:id', (req) =>
     connectionView(cloudConnections.get(req.params.id) ?? notFound('Cloud connection')),
   );
