@@ -3,11 +3,14 @@ import { register as admin } from './admin';
 import { register as aiUsage } from './aiUsage';
 import { register as alerting } from './alerting';
 import { register as bootstrap } from './bootstrap';
+import { register as cost } from './cost';
 import { register as dashboards } from './dashboards';
 import { register as inventory } from './inventory';
 import { register as logs } from './logs';
 import { register as metrics } from './metrics';
 import { register as organizations } from './organizations';
+import { register as posture } from './posture';
+import { register as savedViews } from './savedViews';
 import { register as serviceMap } from './serviceMap';
 import { register as sites } from './sites';
 import { register as synthetics } from './synthetics';
@@ -26,6 +29,9 @@ export function buildRouter(): Router {
     alerting,
     synthetics,
     inventory,
+    cost,
+    posture,
+    savedViews,
     aiUsage,
     organizations,
     admin,

@@ -36,9 +36,9 @@ export const DEMO_VERSION: string =
   (import.meta.env.VITE_APP_VERSION as string | undefined) || '1.0.0';
 
 /** Schema: the newest migration this build ships, applied 9 days ago. */
-const SCHEMA_VERSION = 20261102120000;
+const SCHEMA_VERSION = 20261112090000;
 const RECENT_MIGRATIONS = [
-  20261102120000, 20261027110000, 20261027100000, 20261025090000, 20261020120000,
+  20261112090000, 20261111090000, 20261110090000, 20261102120000, 20261027110000,
 ];
 
 const fromVersion = (version: number) => {
@@ -120,7 +120,9 @@ function schemaStatus(now: number): UpgradeStatus['schema'] {
     recent: RECENT_MIGRATIONS.map((version) => ({
       version,
       // Applied when this release rolled out, or when the migration shipped if later.
-      appliedAt: new Date(Math.max(fromVersion(version) + 6 * HOUR, now - 9 * DAY)).toISOString(),
+      appliedAt: new Date(
+        Math.min(Math.max(fromVersion(version) + 6 * HOUR, now - 9 * DAY), now - HOUR),
+      ).toISOString(),
     })),
   };
 }

@@ -2,7 +2,7 @@
 // visitor creates, edits or deletes is kept in this browser's localStorage
 // (never sent anywhere). Bump STORAGE_KEY's version when seeds change shape.
 
-export const STORAGE_KEY = 'obzly_demo_v1';
+export const STORAGE_KEY = 'obzly_demo_v2';
 
 type Doc = { id: string } & Record<string, unknown>;
 
