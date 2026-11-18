@@ -13,9 +13,13 @@ function demo(): Plugin {
     name: 'obzly-demo',
     // Start from the demo entry, which installs the demo and then loads main.tsx.
     // 'pre', so the swap happens before Vite resolves the page's scripts.
+    // The tab says it's the demo, whatever title the app's own index.html has.
     transformIndexHtml: {
       order: 'pre',
-      handler: (html) => html.replace('/src/main.tsx', '/src/demo/entry.ts'),
+      handler: (html) =>
+        html
+          .replace('/src/main.tsx', '/src/demo/entry.ts')
+          .replace(/<title>[^<]*<\/title>/, '<title>Obzly live demo</title>'),
     },
     configureServer(server) {
       server.middlewares.use('/runtime-config.js', (_req, res) => {
