@@ -6,6 +6,7 @@ import { CHECKOUT_DASHBOARD_ID, INFRA_FOLDER_ID, OVERVIEW_DASHBOARD_ID } from '.
 import { resetDemo } from '../store';
 import { HOUR, PROJECT_ID, STAGING_PROJECT_ID } from '../world';
 import { register } from './dashboards';
+import { fakeSql, resetFakeSql, setSqlResult } from './sql.testkit';
 
 // The traces and metrics areas are built in parallel; pin their seams here.
 vi.mock('../gen/traces', () => ({
@@ -29,6 +30,8 @@ vi.mock('../query/promql', () => ({
     ],
   })),
 }));
+
+vi.mock('../lib/duckdb', async () => (await import('./sql.testkit')).fakeDuckDB);
 
 const router = new Router();
 register(router);
@@ -70,7 +73,10 @@ const range = (hours: number) => ({
   to: new Date().toISOString(),
 });
 
-beforeEach(() => resetDemo());
+beforeEach(() => {
+  resetDemo();
+  resetFakeSql();
+});
 
 describe('dashboards CRUD', () => {
   it('lists the seeded dashboards, pinned first, and folders by title', async () => {
@@ -391,5 +397,158 @@ describe('import', () => {
     expect(await status(call('POST', `${base}/import`, { format: 'kibana', json: '{}' }))).toBe(
       400,
     );
+  });
+});
+
+describe('logs_sql panels', () => {
+  const sqlPanel: Panel = {
+    id: 's',
+    title: 'Errors by service',
+    type: 'table',
+    source: 'logs_sql',
+    sql: 'SELECT level, count(*) AS lines FROM logs GROUP BY 1',
+    gridPos: { x: 0, y: 0, w: 6, h: 6 },
+  };
+  const save = (panel: Partial<Panel>) =>
+    call('POST', base, {
+      title: 'SQL',
+      tabs: [{ id: 't', title: 'T', panels: [{ ...sqlPanel, ...panel }] }],
+    });
+
+  it('saves a SQL panel trimmed, without the other sources fields', async () => {
+    const saved = (await save({
+      type: 'rankedList',
+      sql: '  SELECT level, count(*) AS lines FROM logs GROUP BY 1\n',
+      query: { type: 'condition', condition: { field: 'level', operator: 'equals', value: 'x' } },
+      promQuery: 'up',
+      groupField: 'level',
+      bucketMs: 60_000,
+      serviceName: 'checkout',
+      operationName: 'GET /',
+      rootSpansOnly: true,
+      metric: 'count',
+    })) as Dashboard;
+    const panel = saved.tabs[0].panels[0];
+    expect(panel.sql).toBe('SELECT level, count(*) AS lines FROM logs GROUP BY 1');
+    for (const field of [
+      'query',
+      'promQuery',
+      'groupField',
+      'bucketMs',
+      'serviceName',
+      'operationName',
+      'rootSpansOnly',
+      'metric',
+    ]) {
+      expect(panel, field).not.toHaveProperty(field);
+    }
+  });
+
+  it('refuses SQL panels the backend refuses', async () => {
+    for (const type of ['line', 'rankedList', 'donut', 'table', 'stat'] as const) {
+      expect(await status(save({ type })), type).toBe(200);
+    }
+    expect(await status(save({ type: 'bar' }))).toBe(400);
+    expect(await status(save({ type: 'gauge' }))).toBe(400);
+    expect(await status(save({ sql: '   ' }))).toBe(400);
+    expect(await status(save({ sql: undefined }))).toBe(400);
+    expect(await status(save({ sql: `SELECT 1 ${'-'.repeat(10_000)}` }))).toBe(400);
+    expect(await status(save({ sql: 'DELETE FROM logs' }))).toBe(400);
+    expect(await status(save({ sql: 'SELECT 1; SELECT 2' }))).toBe(400);
+    expect(await status(save({ sql: "SELECT * FROM read_csv('x.csv')" }))).toBe(400);
+    // sql belongs to logs_sql panels only.
+    expect(await status(save({ source: 'logs', sql: 'SELECT 1' }))).toBe(400);
+    expect(await status(save({ source: undefined, type: 'line', sql: 'SELECT 1' }))).toBe(400);
+    await expect(save({ source: 'metrics', promQuery: 'up', sql: 'SELECT 1' })).rejects.toThrow(
+      'sql is a setting of a logs_sql panel, not a metrics one',
+    );
+    await expect(save({ type: 'bar' })).rejects.toThrow(
+      'a logs_sql panel is a line, rankedList, donut, table or stat panel, not bar',
+    );
+  });
+
+  it('runs the SQL over the request range and answers a table', async () => {
+    setSqlResult({
+      columns: ['level', { name: 'lines', type: 'Int64' }],
+      rows: [
+        ['info', 120n],
+        ['error', 7n],
+      ],
+    });
+    const timeRange = range(1);
+    const response = (await call('POST', `${base}/query`, { panel: sqlPanel, timeRange })) as {
+      buckets: unknown[];
+      table: unknown;
+    };
+    expect(response).toEqual({
+      buckets: [],
+      table: {
+        columns: ['level', 'lines'],
+        rows: [
+          ['info', 120],
+          ['error', 7],
+        ],
+      },
+    });
+    expect(fakeSql.statements).toEqual([sqlPanel.sql]);
+    expect(fakeSql.tableTimes.length).toBeGreaterThan(0);
+    const [from, to] = [Date.parse(timeRange.from), Date.parse(timeRange.to)];
+    expect(fakeSql.tableTimes.every((t) => t >= from && t <= to)).toBe(true);
+  });
+
+  it('caps the table at 10,000 rows and says so', async () => {
+    setSqlResult({ columns: ['n'], rows: Array.from({ length: 10_001 }, (_, i) => [i]) });
+    const { table } = (await call('POST', `${base}/query`, {
+      panel: sqlPanel,
+      timeRange: range(1),
+    })) as { table: { rows: unknown[]; truncated?: boolean } };
+    expect(table.rows).toHaveLength(10_000);
+    expect(table.truncated).toBe(true);
+  });
+
+  it('checks a query like a save, before running it', async () => {
+    const query = (panel: Partial<Panel>, timeRange: unknown = range(1)) =>
+      call('POST', `${base}/query`, { panel: { ...sqlPanel, ...panel }, timeRange });
+    expect(await status(query({ sql: 'DROP TABLE logs' }))).toBe(400);
+    expect(await status(query({ type: 'bar' }))).toBe(400);
+    expect(await status(query({}, null))).toBe(400);
+    expect(
+      await status(
+        call('POST', `${base}/query/stream`, {
+          panel: { ...sqlPanel, sql: 'DROP TABLE logs' },
+          timeRange: range(1),
+        }),
+      ),
+    ).toBe(400);
+    expect(fakeSql.statements).toEqual([]);
+  });
+
+  it('streams the table in one buckets frame, then done', async () => {
+    setSqlResult({ columns: ['level', 'lines'], rows: [['info', 3]] });
+    const response = (await call('POST', `${base}/query/stream`, {
+      panel: sqlPanel,
+      timeRange: range(1),
+    })) as Response;
+    expect(response.headers.get('Content-Type')).toBe('application/x-ndjson');
+    expect(await frames(response)).toEqual([
+      { type: 'heartbeat' },
+      { type: 'buckets', table: { columns: ['level', 'lines'], rows: [['info', 3]] } },
+      { type: 'done' },
+    ]);
+  });
+
+  it('streams an error frame when the SQL fails', async () => {
+    setSqlResult(new Error('Binder Error: column "nope" not found'));
+    const response = (await call('POST', `${base}/query/stream`, {
+      panel: { ...sqlPanel, sql: 'SELECT nope FROM logs' },
+      timeRange: range(1),
+    })) as Response;
+    const list = await frames(response);
+    expect(list[list.length - 1]).toEqual({
+      type: 'error',
+      status: 400,
+      error: 'query execution failed: Binder Error: column "nope" not found',
+    });
+    expect(list.some((f) => f.type === 'done')).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
-// Dashboards: CRUD, pins, folders, panel queries (logs, spans and metrics
-// panels, one-shot and streamed), the auto-generated Overview and Grafana /
+// Dashboards: CRUD, pins, folders, panel queries (logs, spans, metrics and
+// logs_sql panels, one-shot and streamed), the auto-generated Overview and Grafana /
 // OpenObserve import. Saved dashboards live in the demo store.
 import type {
   AggregationBucket,
@@ -9,6 +9,7 @@ import type {
   ImportDashboardRequest,
   Panel,
   PanelQueryRequest,
+  PanelTable,
   Tab,
   UpdateDashboardRequest,
   Variable,
@@ -26,6 +27,7 @@ import { DEMO_USER_ID } from '../world';
 import { requireProject } from './bootstrap';
 import { importDashboard } from './dashboardImport';
 import { aggregateLogPanel } from './logs';
+import { runSql, validateSavedSql } from './sql';
 
 const HOUR = 3_600_000;
 
@@ -109,7 +111,36 @@ function checkPanelSettings(panel: Panel) {
     bad(`panel "${panel.title}": invalid higherIs "${panel.higherIs}"`);
   }
 }
-const SOURCES = new Set(['logs', 'spans', 'metrics']);
+const SOURCES = new Set(['logs', 'spans', 'metrics', 'logs_sql']);
+/** The kinds a SQL result's shape can fill (dashboards_services.sqlPanelTypes). */
+export const SQL_PANEL_TYPES = new Set(['line', 'rankedList', 'donut', 'table', 'stat']);
+
+/**
+ * The backend's normalizeSQLPanel: a logs_sql panel needs a valid SQL query
+ * and one of the SQL kinds, and loses the other sources' query fields; any
+ * other panel may not carry SQL.
+ */
+export function normalizeSqlPanel(panel: Panel): Panel {
+  const source = effectivePanelSource(panel);
+  if (source !== 'logs_sql') {
+    if (panel.sql) bad(`sql is a setting of a logs_sql panel, not a ${source} one`);
+    return panel;
+  }
+  if (!SQL_PANEL_TYPES.has(panel.type)) {
+    bad(`a logs_sql panel is a line, rankedList, donut, table or stat panel, not ${panel.type}`);
+  }
+  const sql = validateSavedSql(panel.sql);
+  const normalized: Panel = { ...panel, sql };
+  delete normalized.query;
+  delete normalized.promQuery;
+  delete normalized.groupField;
+  delete normalized.bucketMs;
+  delete normalized.serviceName;
+  delete normalized.operationName;
+  delete normalized.rootSpansOnly;
+  delete normalized.metric;
+  return normalized;
+}
 const UNITS = new Set(['bytes', 'percent']);
 export const SPAN_METRICS = new Set([
   'count',
@@ -159,7 +190,7 @@ function normalizePanels(panels: Panel[] | undefined): Panel[] {
         bad(`invalid panel metric "${panel.metric}"`);
       }
     }
-    return { ...panel, id: panel.id || newId() };
+    return { ...normalizeSqlPanel(panel), id: panel.id || newId() };
   });
 }
 
@@ -311,16 +342,41 @@ export function runPanel(projectId: string, panel: Panel, range: Range): Aggrega
       return aggregateSpanPanel(projectId, { ...panel, metric: panel.metric || 'count' }, range);
     case 'metrics':
       return metricPanelBuckets(projectId, panel, range);
+    case 'logs_sql':
+      return bad('a logs_sql panel answers with a table: use sqlPanelTable');
     default:
       checkLogOptions(panel);
       return aggregateLogPanel(projectId, panel, range);
   }
 }
 
+/** A logs_sql panel's columns and rows over the request's range (closed, checked before). */
+export async function sqlPanelTable(
+  projectId: string,
+  panel: Panel,
+  range: Range,
+): Promise<PanelTable> {
+  const result = await runSql(
+    projectId,
+    panel.sql ?? '',
+    Date.parse(range!.from!),
+    Date.parse(range!.to!),
+  );
+  // truncated is omitempty on the server.
+  return result.truncated
+    ? { columns: result.columns, rows: result.rows, truncated: true }
+    : { columns: result.columns, rows: result.rows };
+}
+
+/**
+ * The request, checked before anything runs (a refused query is a plain 400,
+ * not a stream): its range, and an (often unsaved) SQL panel as on a save.
+ */
 function panelRequest(body: unknown): PanelQueryRequest {
   const request = (body ?? {}) as PanelQueryRequest;
   if (!request.panel || typeof request.panel !== 'object') bad('Invalid request format');
-  return request;
+  requireClosedRange(request.panel, request.timeRange);
+  return { ...request, panel: normalizeSqlPanel(request.panel) };
 }
 
 // --- Overview -----------------------------------------------------------------------
@@ -486,21 +542,32 @@ export function register(r: Router) {
     });
   });
 
-  r.post(`${base}/query`, (req) => {
+  r.post(`${base}/query`, async (req) => {
     requireProject(req.params.pid);
     const request = panelRequest(req.body);
-    requireClosedRange(request.panel, request.timeRange);
+    if (effectivePanelSource(request.panel) === 'logs_sql') {
+      return {
+        buckets: [],
+        table: await sqlPanelTable(req.params.pid, request.panel, request.timeRange),
+      };
+    }
     return { buckets: runPanel(req.params.pid, request.panel, request.timeRange) };
   });
 
   r.post(`${base}/query/stream`, (req) => {
     requireProject(req.params.pid);
     const request = panelRequest(req.body);
-    requireClosedRange(request.panel, request.timeRange);
     const projectId = req.params.pid;
     return ndjson(async (send, signal) => {
       send({ type: 'heartbeat' });
       await sleep(30, signal);
+      if (effectivePanelSource(request.panel) === 'logs_sql') {
+        // One frame with the table (its buckets are empty, so left out).
+        const table = await sqlPanelTable(projectId, request.panel, request.timeRange);
+        send({ type: 'buckets', table });
+        send({ type: 'done' });
+        return;
+      }
       const buckets = runPanel(projectId, request.panel, request.timeRange);
       const timed =
         effectivePanelSource(request.panel) === 'logs' && (request.panel.bucketMs ?? 0) > 0;

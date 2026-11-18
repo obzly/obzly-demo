@@ -1,5 +1,5 @@
 // Alerting: rules (with live previews over the demo's logs, traces and
-// metrics), the alerts the recurring incident raises and clears, silences,
+// metrics, and logs_sql rules' SQL run in the SQL mode's DuckDB), the alerts the recurring incident raises and clears, silences,
 // project channels and the deployment-level channels and email settings.
 // Nothing is ever sent: channel tests answer "(demo: nothing was sent)".
 import type {
@@ -59,6 +59,7 @@ import { PROJECT_ID, incidentsBetween } from '../world';
 import { requireProject } from './bootstrap';
 import { SPAN_GROUPS, SPAN_METRICS, runPanel } from './dashboards';
 import { aggregateLogPanel } from './logs';
+import { runSql, validateSavedSql } from './sql';
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -124,6 +125,9 @@ function applyRule(projectId: string, request: RuleRequest): Omit<AlertRule, 'id
     case 'logs':
       query = { logs: q.logs, groupBy: (q.groupBy ?? '').trim() };
       break;
+    case 'logs_sql':
+      query = { sql: validateSavedSql(q.sql) };
+      break;
     case 'log_patterns': {
       const baseline = q.baselineSeconds || 86400;
       if (baseline < 3600 || baseline > 7 * 86400) {
@@ -151,7 +155,7 @@ function applyRule(projectId: string, request: RuleRequest): Omit<AlertRule, 'id
       break;
     }
     default:
-      return bad('source must be metrics, logs, log_patterns or traces');
+      return bad('source must be metrics, logs, log_patterns, logs_sql or traces');
   }
   const known = new Set(channelsFor(projectId).map((c) => c.id));
   if (channelIds.some((id) => !known.has(id))) bad('every channel must belong to this project');
@@ -446,9 +450,141 @@ export function evaluateRule(
     }
     case 'log_patterns':
       return patternSamples(projectId, rule, now);
+    case 'logs_sql':
+      return bad('a logs_sql rule runs its SQL asynchronously: use ruleSamples');
     default:
       return bad(`unknown rule source "${rule.source}"`);
   }
+}
+
+// --- logs_sql rules (backend alerting/sql_source.go) ----------------------------------
+
+const SQL_VALUE_COLUMN = 'value';
+const MAX_SQL_LABEL_LENGTH = 200;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** A number; numeric text only for the "value" column ("200" elsewhere is a label). */
+function sqlNumber(value: unknown, allowText: boolean): number | undefined {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (allowText && typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value.trim());
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+/** SQL mode returns TIMESTAMP and DATE values as RFC 3339 text. */
+const sqlTime = (value: unknown): number | undefined =>
+  typeof value === 'string' && RFC3339.test(value) ? Date.parse(value) : undefined;
+
+/** The column has a value, and test holds for every non-null one. */
+function everyNonNull(rows: unknown[][], column: number, test: (v: unknown) => boolean): boolean {
+  let seen = false;
+  for (const row of rows) {
+    const cell = row[column];
+    if (cell === null || cell === undefined) continue;
+    if (!test(cell)) return false;
+    seen = true;
+  }
+  return seen;
+}
+
+/** attrnames.Normalize ("count_star()" -> "count_star__"); unnamed is column_<n>. */
+function sqlLabelName(column: string, index: number): string {
+  const name = column.replace(/^resource\./, '').replace(/[^A-Za-z0-9_]/gu, '_');
+  if (!name) return `column_${index + 1}`;
+  return /^[0-9]/.test(name) ? `_${name}` : name;
+}
+
+function sqlLabelValue(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+/** The evaluator's truncate: at most `limit` UTF-8 bytes, cut on a character boundary. */
+function truncateBytes(value: string, limit: number): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(value).length <= limit) return value;
+  let out = '';
+  let bytes = 0;
+  for (const char of value) {
+    bytes += encoder.encode(char).length;
+    if (bytes > limit) break;
+    out += char;
+  }
+  return out;
+}
+
+/**
+ * A logs_sql rule's result as series: one per row, its value the "value"
+ * column (else the last numeric column) and its labels the other columns.
+ * With a time column only each label set's latest row counts.
+ */
+export function sqlSamples(columns: string[], rows: unknown[][]): Sample[] {
+  if (!rows.length) return [];
+  let valueColumn = columns.findIndex((name) => name.toLowerCase() === SQL_VALUE_COLUMN);
+  if (valueColumn < 0) {
+    for (let i = columns.length - 1; i >= 0; i--) {
+      if (everyNonNull(rows, i, (v) => sqlNumber(v, false) !== undefined)) {
+        valueColumn = i;
+        break;
+      }
+    }
+  }
+  if (valueColumn < 0) {
+    bad(`the query must return a number: a column named ${SQL_VALUE_COLUMN}, or a numeric column`);
+  }
+  const timeColumn = columns.findIndex(
+    (_, i) => i !== valueColumn && everyNonNull(rows, i, (v) => sqlTime(v) !== undefined),
+  );
+  const series = new Map<string, { sample: Sample; at: number }>();
+  for (const row of rows) {
+    const value = sqlNumber(row[valueColumn], true);
+    if (value === undefined) continue;
+    const labels: Record<string, string> = {};
+    columns.forEach((name, i) => {
+      if (i === valueColumn || i === timeColumn) return;
+      labels[sqlLabelName(name, i)] = truncateBytes(sqlLabelValue(row[i]), MAX_SQL_LABEL_LENGTH);
+    });
+    const at = timeColumn >= 0 ? (sqlTime(row[timeColumn]) ?? 0) : 0;
+    const key = fingerprint(labels);
+    const existing = series.get(key);
+    if (!existing) {
+      series.set(key, { sample: { labels, value }, at });
+    } else if (timeColumn >= 0 && at > existing.at) {
+      existing.sample.value = value;
+      existing.at = at;
+    }
+  }
+  if (series.size > MAX_SERIES) {
+    bad(
+      `the query returns ${series.size} series; a SQL rule may watch at most ${MAX_SERIES} ` +
+        '(ORDER BY the value and LIMIT it)',
+    );
+  }
+  return [...series.values()].map((entry) => entry.sample);
+}
+
+/** One evaluation of any rule at `now`; a logs_sql rule runs its SQL over [now - window, now]. */
+export async function ruleSamples(
+  projectId: string,
+  rule: Omit<AlertRule, 'id' | 'projectId'>,
+  now = Date.now(),
+): Promise<Sample[]> {
+  if (rule.source !== 'logs_sql') return evaluateRule(projectId, rule, now);
+  const result = await runSql(
+    projectId,
+    rule.query.sql ?? '',
+    now - rule.windowSeconds * 1000,
+    now,
+  );
+  if (result.truncated) {
+    bad(
+      `the query returns more than ${result.rows.length} rows; aggregate it to one row per series`,
+    );
+  }
+  return sqlSamples(result.columns, result.rows);
 }
 
 // --- alerts the incident raises ------------------------------------------------------------
@@ -752,10 +888,10 @@ export function register(r: Router) {
     );
   });
 
-  r.post(`${project}/alert-rules/preview`, (req): PreviewSeries[] => {
+  r.post(`${project}/alert-rules/preview`, async (req): Promise<PreviewSeries[]> => {
     requireProject(req.params.pid);
     const rule = applyRule(req.params.pid, (req.body ?? {}) as RuleRequest);
-    return evaluateRule(req.params.pid, rule).map((sample) => ({
+    return (await ruleSamples(req.params.pid, rule)).map((sample) => ({
       labels: sample.labels,
       value: sample.value,
       firing: compare(rule.comparison, sample.value, rule.threshold),

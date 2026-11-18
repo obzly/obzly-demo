@@ -20,7 +20,8 @@ import {
 import { checkout5xx } from '../seed/dashboards';
 import { resetDemo } from '../store';
 import { MINUTE, PROJECT_ID, STAGING_PROJECT_ID, incidentsBetween } from '../world';
-import { deriveAlerts, evaluateRule, register } from './alerting';
+import { deriveAlerts, evaluateRule, register, sqlSamples } from './alerting';
+import { fakeSql, resetFakeSql, setSqlResult } from './sql.testkit';
 
 vi.mock('../gen/traces', () => ({
   aggregateSpanPanel: vi.fn(() => [
@@ -37,6 +38,8 @@ vi.mock('../query/promql', () => ({
     ],
   })),
 }));
+
+vi.mock('../lib/duckdb', async () => (await import('./sql.testkit')).fakeDuckDB);
 
 const router = new Router();
 register(router);
@@ -90,7 +93,10 @@ const newRule = {
   channelIds: [CHANNEL_SRE_EMAIL],
 };
 
-beforeEach(() => resetDemo());
+beforeEach(() => {
+  resetDemo();
+  resetFakeSql();
+});
 
 describe('rules', () => {
   it('lists the seeded rules with a last evaluation for enabled ones', async () => {
@@ -332,5 +338,149 @@ describe('channels and settings', () => {
     expect(JSON.stringify(saved)).not.toContain('"p"');
     expect(await status(call('POST', '/settings/smtp/test', { to: 'a@example.com' }))).toBe(403);
     expect(((await call('GET', '/settings/sync')) as { mode: string }).mode).toBe('control-plane');
+  });
+});
+
+describe('logs_sql rules', () => {
+  const SQL =
+    "SELECT json_extract_string(fields, '$.service_name') AS service, count(*) AS value " +
+    "FROM logs WHERE lower(level) = 'error' GROUP BY 1";
+  const sqlRule = { ...newRule, source: 'logs_sql', query: { sql: SQL }, threshold: 10 };
+
+  it('creates and lists a SQL rule with only its trimmed SQL', async () => {
+    const created = (await call('POST', `${p}/alert-rules`, {
+      ...sqlRule,
+      query: { sql: `  ${SQL}\n`, logs: newRule.query.logs, groupBy: 'level', promql: 'up' },
+    })) as AlertRule;
+    expect(created.source).toBe('logs_sql');
+    expect(created.query).toEqual({ sql: SQL });
+    const listed = (await call('GET', `${p}/alert-rules`)) as AlertRule[];
+    expect(listed.find((r) => r.id === created.id)?.query).toEqual({ sql: SQL });
+    const updated = (await call('PUT', `${p}/alert-rules/${created.id}`, {
+      ...sqlRule,
+      query: { sql: 'SELECT count(*) AS value FROM logs' },
+    })) as AlertRule;
+    expect(updated.query).toEqual({ sql: 'SELECT count(*) AS value FROM logs' });
+  });
+
+  it('refuses SQL the backend refuses, with a clear message', async () => {
+    const create = (sql: unknown) =>
+      call('POST', `${p}/alert-rules`, { ...sqlRule, query: { sql } });
+    await expect(create('  ')).rejects.toThrow('a SQL query is required');
+    await expect(create(undefined)).rejects.toThrow('a SQL query is required');
+    await expect(create(`SELECT 1 ${'-'.repeat(10_000)}`)).rejects.toThrow(
+      'the SQL query exceeds the 10000 character limit',
+    );
+    await expect(create('DROP TABLE logs')).rejects.toThrow(
+      'invalid SQL query: only SELECT statements are allowed',
+    );
+    await expect(create('SELECT 1; SELECT 2')).rejects.toThrow(
+      'invalid SQL query: only one statement is allowed',
+    );
+    expect(await status(create('DROP TABLE logs'))).toBe(400);
+    await expect(call('POST', `${p}/alert-rules`, { ...sqlRule, source: 'sql' })).rejects.toThrow(
+      'source must be metrics, logs, log_patterns, logs_sql or traces',
+    );
+  });
+
+  it('previews each row as a series over [now - window, now]', async () => {
+    setSqlResult({
+      columns: ['service', { name: 'value', type: 'Int64' }],
+      rows: [
+        ['checkout', 42n],
+        ['payments', 3n],
+      ],
+    });
+    const before = Date.now();
+    const preview = (await call('POST', `${p}/alert-rules/preview`, {
+      ...sqlRule,
+      windowSeconds: 600,
+    })) as PreviewSeries[];
+    expect(preview).toEqual([
+      { labels: { service: 'checkout' }, value: 42, firing: true },
+      { labels: { service: 'payments' }, value: 3, firing: false },
+    ]);
+    expect(fakeSql.statements).toEqual([SQL]);
+    expect(fakeSql.tableTimes.length).toBeGreaterThan(0);
+    expect(fakeSql.tableTimes.every((t) => t >= before - 600_000 && t <= Date.now())).toBe(true);
+  });
+
+  it('refuses a truncated result and a failing query', async () => {
+    setSqlResult({ columns: ['value'], rows: Array.from({ length: 10_001 }, (_, i) => [i]) });
+    await expect(call('POST', `${p}/alert-rules/preview`, sqlRule)).rejects.toThrow(
+      'the query returns more than 10000 rows; aggregate it to one row per series',
+    );
+    setSqlResult(new Error('Binder Error: nope'));
+    expect(await status(call('POST', `${p}/alert-rules/preview`, sqlRule))).toBe(400);
+  });
+
+  describe('sqlSamples', () => {
+    it('takes the value column, else the last numeric column', () => {
+      expect(sqlSamples(['value', 'service'], [[5, 'checkout']])).toEqual([
+        { labels: { service: 'checkout' }, value: 5 },
+      ]);
+      expect(sqlSamples(['service', 'lines', 'p95'], [['checkout', 10, 2.5]])).toEqual([
+        { labels: { service: 'checkout', lines: '10' }, value: 2.5 },
+      ]);
+      // VALUE matches case-insensitively, even before a later numeric column.
+      expect(sqlSamples(['VALUE', 'n'], [[1, 2]])).toEqual([{ labels: { n: '2' }, value: 1 }]);
+    });
+
+    it('reads numeric text only in the value column', () => {
+      expect(sqlSamples(['service', 'value'], [['checkout', ' 7.5 ']])).toEqual([
+        { labels: { service: 'checkout' }, value: 7.5 },
+      ]);
+      // "200" is a status code label, not the measurement.
+      expect(sqlSamples(['status', 'n'], [['200', 4]])).toEqual([
+        { labels: { status: '200' }, value: 4 },
+      ]);
+      expect(() => sqlSamples(['status'], [['200']])).toThrow(
+        'the query must return a number: a column named value, or a numeric column',
+      );
+      expect(() => sqlSamples(['service'], [['checkout']])).toThrow('a numeric column');
+    });
+
+    it('skips null values and makes column names label-safe', () => {
+      expect(
+        sqlSamples(
+          ['service.name', 'count_star()', '1st', '', 'value'],
+          [
+            ['checkout', 'a', 'b', 'c', 1],
+            ['payments', 'a', 'b', 'c', null],
+          ],
+        ),
+      ).toEqual([
+        {
+          labels: { service_name: 'checkout', count_star__: 'a', _1st: 'b', column_4: 'c' },
+          value: 1,
+        },
+      ]);
+      expect(sqlSamples(['value'], [])).toEqual([]);
+    });
+
+    it("keeps each label set's latest row when there is a time column", () => {
+      expect(
+        sqlSamples(
+          ['minute', 'service', 'value'],
+          [
+            ['2026-11-18T10:01:00.000Z', 'checkout', 9],
+            ['2026-11-18T10:00:00.000Z', 'checkout', 4],
+            ['2026-11-18T10:00:00.000Z', 'payments', 2],
+            ['2026-11-18T10:02:00.000Z', 'checkout', 7],
+          ],
+        ),
+      ).toEqual([
+        { labels: { service: 'checkout' }, value: 7 },
+        { labels: { service: 'payments' }, value: 2 },
+      ]);
+    });
+
+    it('allows at most 100 series', () => {
+      const rows = (n: number) => Array.from({ length: n }, (_, i) => [`s${i}`, i]);
+      expect(sqlSamples(['service', 'value'], rows(100))).toHaveLength(100);
+      expect(() => sqlSamples(['service', 'value'], rows(101))).toThrow(
+        'the query returns 101 series; a SQL rule may watch at most 100',
+      );
+    });
   });
 });

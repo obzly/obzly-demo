@@ -38,7 +38,13 @@ export function ndjson(
         await produce(send, controller.signal);
       } catch (error) {
         if (!(error instanceof DOMException && error.name === 'AbortError')) {
-          send({ type: 'error', error: error instanceof Error ? error.message : String(error) });
+          // Like the server's error frame: the status a plain answer would have had.
+          const status = (error as { status?: unknown } | null)?.status;
+          send({
+            type: 'error',
+            ...(typeof status === 'number' ? { status } : {}),
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
       try {
