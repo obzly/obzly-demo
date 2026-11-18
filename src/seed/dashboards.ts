@@ -1,7 +1,8 @@
 // The demo's saved dashboards: what a Harborline engineer would have built.
 // Logs panels read the generated logs, spans panels the generated traces and
 // metrics panels PromQL over the metric registry's standard OTel/Prometheus
-// names, so each panel shows the recurring payments incident in its own way.
+// names and logs_sql panels SQL mode's DuckDB over the generated logs, so each
+// panel shows the recurring payments incident in its own way.
 import type { Dashboard, Folder, Panel, Tab, Variable } from '../../entity/dashboards';
 import type { QueryNode } from '../../entity/query';
 import { uuidFrom } from '../lib/rng';
@@ -75,6 +76,28 @@ function metricsPanel(
   if (unit) panel.unit = unit;
   return panel;
 }
+
+function sqlPanel(
+  key: string,
+  title: string,
+  type: Panel['type'],
+  sql: string,
+  gridPos: Grid,
+): Panel {
+  return { id: uuidFrom(`demo-panel:${key}`), title, type, source: 'logs_sql', sql, gridPos };
+}
+
+/** The seeded logs_sql panel: errors and error rate per service, one row each. */
+export const ERRORS_BY_SERVICE_SQL = [
+  "SELECT json_extract_string(fields, '$.service_name') AS service,",
+  '  count(*) AS lines,',
+  "  count(*) FILTER (WHERE lower(level) IN ('error', 'fatal')) AS errors,",
+  "  round(100.0 * count(*) FILTER (WHERE lower(level) IN ('error', 'fatal')) / count(*), 2) AS error_pct",
+  'FROM logs',
+  'GROUP BY 1',
+  'ORDER BY errors DESC, lines DESC',
+  'LIMIT 10',
+].join('\n');
 
 const tab = (key: string, title: string, panels: Panel[]): Tab => ({
   id: uuidFrom(`demo-tab:${key}`),
@@ -164,6 +187,13 @@ function harborlineOverview(): Dashboard {
       thresholds: { warn: 500, critical: 1500 },
       higherIs: 'bad',
     }),
+    sqlPanel(
+      'gl:sql-errors',
+      'Errors by service (SQL)',
+      'table',
+      ERRORS_BY_SERVICE_SQL,
+      grid(0, 19, 12, 8),
+    ),
   ]);
   const overview = tab('overview:main', 'Overview', [
     spansPanel('ov:requests', 'Requests', 'stat', grid(0, 0, 3, 4), {

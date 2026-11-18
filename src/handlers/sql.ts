@@ -2,6 +2,7 @@
 // query) over a "logs" table built from the time range's generated logs,
 // with the backend's columns (backend/internal/features/logs/querier/sql.go):
 // timestamp, level, message, client_ip, trace_id, span_id, fields (JSON text).
+// logs_sql dashboard panels and alert rules run their SQL here too (runSql).
 import type { ExecuteSQLQueryRequest } from '../../entity/query';
 import { type GenLog, walkLogs } from '../gen/logs';
 import { type DuckConnection, type DuckDatabase, startDuckDB } from '../lib/duckdb';
@@ -60,6 +61,28 @@ export function validateSql(sql: string): string {
   return stripped;
 }
 
+/** The backend's MaxSQLQueryLength for SQL saved in a panel or an alert rule. */
+export const MAX_SAVED_SQL_LENGTH = 10_000;
+
+/**
+ * logs_core.ValidateSavedSQL: the SQL a logs_sql panel or alert rule keeps,
+ * trimmed; required, at most 10,000 characters and one SELECT like SQL mode's.
+ */
+export function validateSavedSql(sql: unknown): string {
+  const trimmed = typeof sql === 'string' ? sql.trim() : '';
+  if (!trimmed) throw new DemoError(400, 'a SQL query is required');
+  if (trimmed.length > MAX_SAVED_SQL_LENGTH) {
+    throw new DemoError(400, `the SQL query exceeds the ${MAX_SAVED_SQL_LENGTH} character limit`);
+  }
+  try {
+    validateSql(trimmed);
+  } catch (error) {
+    if (!(error instanceof DemoError)) throw error;
+    throw new DemoError(400, `invalid SQL query: ${error.message.replace(/^invalid query: /, '')}`);
+  }
+  return trimmed;
+}
+
 async function prepareTable(conn: Conn, db: Db, projectId: string, from: number, to: number) {
   // Re-running a query on the same range reuses the table (rounded to 10 s).
   const key = `${projectId}:${Math.floor(from / 10_000)}:${Math.floor(to / 10_000)}`;
@@ -111,16 +134,26 @@ export const toCell = (value: unknown, isTime: boolean): unknown => {
   return value;
 };
 
-export function registerSql(r: Router) {
-  r.post('/logs/query/execute-sql/:pid', async (req) => {
-    requireProject(req.params.pid);
-    const body = (req.body ?? {}) as ExecuteSQLQueryRequest;
-    const statement = validateSql(body.sql ?? '');
-    const started = performance.now();
-    const to = body.timeRange?.to ? Date.parse(body.timeRange.to) : Date.now();
-    const from = body.timeRange?.from ? Date.parse(body.timeRange.from) : to - 3_600_000;
+export interface SqlResult {
+  columns: string[];
+  rows: unknown[][];
+  /** More than MAX_RESULT_ROWS rows; only the first ones are in rows. */
+  truncated: boolean;
+}
+
+// One engine, one "logs" table: queries take turns, so a dashboard's SQL
+// panels (each with its own range) don't rebuild the table under each other.
+let queue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Runs one validated statement over the project's logs in [from, to] (epoch
+ * ms): SQL mode, logs_sql dashboard panels and logs_sql alert rules.
+ */
+export function runSql(projectId: string, sql: string, from: number, to: number) {
+  const statement = validateSql(sql);
+  const run = queue.then(async (): Promise<SqlResult> => {
     const { db, conn } = await loadEngine();
-    await prepareTable(conn, db, req.params.pid, from, to);
+    await prepareTable(conn, db, projectId, from, to);
     let table;
     try {
       table = await conn.query(statement);
@@ -141,8 +174,24 @@ export function registerSql(r: Router) {
     return {
       columns: fields.map((field) => field.name),
       rows,
-      rowCount: rows.length,
       truncated: table.numRows > MAX_RESULT_ROWS,
+    };
+  });
+  queue = run.catch(() => undefined);
+  return run;
+}
+
+export function registerSql(r: Router) {
+  r.post('/logs/query/execute-sql/:pid', async (req) => {
+    requireProject(req.params.pid);
+    const body = (req.body ?? {}) as ExecuteSQLQueryRequest;
+    const started = performance.now();
+    const to = body.timeRange?.to ? Date.parse(body.timeRange.to) : Date.now();
+    const from = body.timeRange?.from ? Date.parse(body.timeRange.from) : to - 3_600_000;
+    const result = await runSql(req.params.pid, body.sql ?? '', from, to);
+    return {
+      ...result,
+      rowCount: result.rows.length,
       executedInMs: goDuration(performance.now() - started),
     };
   });
