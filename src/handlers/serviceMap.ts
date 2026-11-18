@@ -2,7 +2,13 @@
 // sampled traces) merged with network-derived ones, like the server does
 // with OBI flow metrics. Postgres and Valkey aren't instrumented, so their
 // edges come from the network only; instrumented edges carry both.
-import type { ServiceMapEdge, ServiceMapNode, ServiceMapResponse } from '../../entity/serviceMap';
+import type {
+  ServiceMapEdge,
+  ServiceMapHealth,
+  ServiceMapNode,
+  ServiceMapNodeType,
+  ServiceMapResponse,
+} from '../../entity/serviceMap';
 import { SUPPORT_ASSISTANT, namespaceOf, resolveRange, sampledTraces } from '../gen/traces';
 import type { Router } from '../router';
 import { podsFor, workloadByService } from '../world';
@@ -35,6 +41,33 @@ interface EdgeAcc {
   bytes: number;
 }
 
+interface NodeAcc {
+  requests: number;
+  errors: number;
+  durations: [number, number][];
+}
+
+const NODE_TYPES: Record<string, ServiceMapNodeType> = { postgres: 'database', valkey: 'cache' };
+
+/** The server's healthOf: 5%+ errors fail; 1%+ errors or a p95 of 800 ms+ degrade. */
+function healthOf(errorRate: number, p95: number | undefined): ServiceMapHealth {
+  if (errorRate >= 0.05) return 'failing';
+  if (errorRate >= 0.01 || (p95 !== undefined && p95 >= 800)) return 'degraded';
+  return 'ok';
+}
+
+function p95Of(values: [number, number][]): number | undefined {
+  if (!values.length) return undefined;
+  values.sort((a, b) => a[0] - b[0]);
+  const total = values.reduce((sum, [, w]) => sum + w, 0);
+  let seen = 0;
+  for (const [value, weight] of values) {
+    seen += weight;
+    if (seen >= total * 0.95) return Math.round(value * 100) / 100;
+  }
+  return Math.round(values[values.length - 1][0] * 100) / 100;
+}
+
 export function buildServiceMap(projectId: string, from: number, to: number): ServiceMapResponse {
   const now = Date.now();
   const end = Math.min(to, now);
@@ -49,6 +82,13 @@ export function buildServiceMap(projectId: string, from: number, to: number): Se
     }
     return acc;
   };
+  // RED per node: a service's entry spans, or the client spans calling an untraced peer.
+  const red = new Map<string, NodeAcc>();
+  const redOf = (name: string) => {
+    let acc = red.get(name);
+    if (!acc) red.set(name, (acc = { requests: 0, errors: 0, durations: [] }));
+    return acc;
+  };
   sampledTraces(
     projectId,
     start,
@@ -56,6 +96,12 @@ export function buildServiceMap(projectId: string, from: number, to: number): Se
     SAMPLE_BUDGET,
     (trace, weight) => {
       for (const span of trace.spans) {
+        if (span.kind === 'SERVER' || !span.parentSpanId) {
+          const acc = redOf(span.service);
+          acc.requests += weight;
+          if (span.status === 'ERROR') acc.errors += weight;
+          acc.durations.push([span.end - span.start, weight]);
+        }
         if (span.parentService && span.parentService !== span.service) {
           const acc = edge(span.parentService, span.service);
           acc.spans = true;
@@ -68,6 +114,10 @@ export function buildServiceMap(projectId: string, from: number, to: number): Se
         if (span.kind === 'CLIENT' && (db === 'postgresql' || db === 'valkey')) {
           const target = db === 'postgresql' ? 'postgres' : 'valkey';
           edge(span.service, target).bytes += DB_BYTES[target] * weight;
+          const acc = redOf(target);
+          acc.requests += weight;
+          if (span.status === 'ERROR') acc.errors += weight;
+          acc.durations.push([span.end - span.start, weight]);
         }
       }
     },
@@ -109,6 +159,16 @@ export function buildServiceMap(projectId: string, from: number, to: number): Se
       name,
       sources: (['spans', 'network'] as const).filter((s) => set.has(s)),
     };
+    const acc = red.get(name);
+    const type = NODE_TYPES[name] ?? (set.has('spans') || acc ? 'service' : undefined);
+    if (type) node.type = type;
+    if (acc && acc.requests > 0) {
+      node.requests = Math.round(acc.requests);
+      node.errors = Math.round(acc.errors);
+      node.errorRate = acc.errors / acc.requests;
+      node.p95LatencyMs = p95Of(acc.durations);
+      node.health = healthOf(node.errorRate, node.p95LatencyMs);
+    }
     const workload = workloadByService.get(name);
     if (name === SUPPORT_ASSISTANT.service) node.namespace = namespaceOf(name);
     if (workload) {
@@ -121,7 +181,7 @@ export function buildServiceMap(projectId: string, from: number, to: number): Se
     }
     return node;
   });
-  return { nodes, edges: outEdges };
+  return { nodes, edges: outEdges, windowSeconds: Math.round((end - start) / 1000) };
 }
 
 export function register(r: Router) {

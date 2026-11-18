@@ -5,11 +5,19 @@
 import type {
   AlertRule,
   AlertView,
+  AlertsSummary,
   ChannelConfig,
   ChannelKind,
+  ChannelTemplateRequest,
+  IncidentNotificationRequest,
+  IncidentNotificationSettings,
   Matcher,
+  MessageTemplate,
+  MessageTemplatesView,
   NotificationChannel,
   PreviewSeries,
+  RuleActivity,
+  RuleActivityResponse,
   RuleRequest,
   SMTPRequest,
   SMTPSettings,
@@ -18,13 +26,25 @@ import type {
   SettingsSync,
   Silence,
   SilenceRequest,
+  TemplatePreviewRequest,
+  TemplateError as TemplateProblem,
 } from '../../entity/alerting';
 import type { AggregationBucket, Panel } from '../../entity/dashboards';
 import { ALL_TEMPLATES, patternHashOf } from '../gen/logs';
-import { hashString, hex } from '../lib/rng';
+import {
+  CHANNEL_KINDS,
+  SEVERITIES,
+  defaultTemplate,
+  normalizeSeverity,
+  previewTemplate,
+  validateTemplate,
+} from '../gen/messageTemplates';
+import { hashString, hex, mix } from '../lib/rng';
 import { evaluatePromQL } from '../query/promql';
 import { DemoError, type Router, notInDemo } from '../router';
 import {
+  CHANNEL_PLATFORM_SLACK,
+  CHANNEL_WEBHOOK,
   INCIDENT_ALERTS,
   type StoredChannel,
   describeChannel,
@@ -35,12 +55,13 @@ import {
 } from '../seed/alerting';
 import { DEMO_SITE_ID } from '../seed/site';
 import { collection, newId, value } from '../store';
-import { incidentsBetween } from '../world';
+import { PROJECT_ID, incidentsBetween } from '../world';
 import { requireProject } from './bootstrap';
 import { SPAN_GROUPS, SPAN_METRICS, runPanel } from './dashboards';
 import { aggregateLogPanel } from './logs';
 
 const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
 const MAX_SERIES = 100;
 
 export const rules = collection<AlertRule>('alertRules', seedRules);
@@ -147,6 +168,12 @@ function applyRule(projectId: string, request: RuleRequest): Omit<AlertRule, 'id
     repeatSeconds: repeat ?? 4 * 3600,
     labels,
     summary: (request.summary ?? '').slice(0, 2000),
+    severity: request.severity
+      ? SEVERITIES.includes(request.severity)
+        ? request.severity
+        : bad('severity must be critical, high, medium or low')
+      : normalizeSeverity(labels.severity),
+    description: (request.description ?? '').trim().slice(0, 4000),
     lastError: '',
     channelIds,
   };
@@ -167,10 +194,95 @@ function refuseManaged(rule: AlertRule) {
 }
 
 /** Rules as listed: enabled ones were last evaluated on their interval's grid. */
-function withEval(rule: AlertRule, now = Date.now()): AlertRule {
-  if (!rule.enabled) return rule;
+/** When a rule was made: stored for new rules; seeded ones date from 20 to 80 days ago. */
+export function ruleCreatedAt(rule: AlertRule, now = Date.now()): number {
+  if (rule.createdAt) return Date.parse(rule.createdAt);
+  return now - (20 + (hashString(rule.id) % 60)) * DAY - (hashString(rule.name) % 20) * HOUR;
+}
+
+function withEval(stored: AlertRule, now = Date.now()): AlertRule {
+  // Rules saved by an older demo have no severity or description yet.
+  const rule: AlertRule = {
+    ...stored,
+    severity: stored.severity ?? normalizeSeverity(stored.labels?.severity),
+    description: stored.description ?? '',
+  };
+  const createdAt = new Date(ruleCreatedAt(rule, now)).toISOString();
+  if (!rule.enabled) return { ...rule, createdAt };
   const interval = (rule.intervalSeconds || 60) * 1000;
-  return { ...rule, lastEvalAt: new Date(Math.floor(now / interval) * interval).toISOString() };
+  return {
+    ...rule,
+    createdAt,
+    lastEvalAt: new Date(Math.floor(now / interval) * interval).toISOString(),
+  };
+}
+
+// --- activity (Rules tab, Overview) -------------------------------------------------------
+
+const ACTIVITY_DAYS = 7;
+
+/** Each rule's firings and notifications per UTC day over the last week, today so far. */
+export function ruleActivity(projectId: string, now = Date.now()): RuleActivityResponse {
+  const today = Math.floor(now / DAY) * DAY;
+  const days = Array.from(
+    { length: ACTIVITY_DAYS },
+    (_, i) => today - (ACTIVITY_DAYS - 1 - i) * DAY,
+  );
+  const incidentRules = new Map(INCIDENT_ALERTS.map((def) => [def.ruleId, def]));
+  const out: RuleActivity[] = [];
+  for (const rule of rules.find((r) => r.projectId === projectId)) {
+    const created = ruleCreatedAt(rule, now);
+    const fired: number[] = [];
+    const notifications: number[] = [];
+    const def = incidentRules.get(rule.id);
+    const deliveries = Math.max(1, rule.channelIds.length);
+    days.forEach((day) => {
+      const end = Math.min(day + DAY, now);
+      if (!rule.enabled || end <= created) {
+        fired.push(0);
+        notifications.push(0);
+        return;
+      }
+      let count: number;
+      if (def) {
+        // One firing per incident that got past its pending period.
+        count = incidentsBetween(Math.max(day, created), end).filter(
+          (incident) =>
+            incident.start >= day && incident.start + def.onsetMs + rule.forSeconds * 1000 <= end,
+        ).length;
+      } else {
+        const roll = mix(hashString(rule.id), Math.floor(day / DAY));
+        count = roll % 5 === 0 ? 1 + ((roll >> 3) % 3) : roll % 7 === 1 ? 1 : 0;
+        if (day === today && count > 0)
+          count = Math.min(count, 1 + Math.floor((now - day) / (8 * HOUR)));
+      }
+      fired.push(count);
+      // Firing and resolved to each channel, plus a reminder now and then.
+      notifications.push(
+        count * deliveries * 2 + (count > 1 && rule.repeatSeconds ? deliveries : 0),
+      );
+    });
+    const firedTotal = fired.reduce((a, b) => a + b, 0);
+    const notificationsTotal = notifications.reduce((a, b) => a + b, 0);
+    if (firedTotal + notificationsTotal === 0) continue;
+    out.push({ ruleId: rule.id, fired, notifications, firedTotal, notificationsTotal });
+  }
+  return {
+    days: days.map((d) => new Date(d).toISOString().slice(0, 10)),
+    trackedSince: new Date(now - 40 * DAY).toISOString(),
+    rules: out.sort((a, b) => b.firedTotal - a.firedTotal),
+  };
+}
+
+/** The Alerts page header: firing and pending alerts, rules and current or upcoming silences. */
+export function alertsSummary(projectId: string, now = Date.now()): AlertsSummary {
+  const alerts = deriveAlerts(projectId, now);
+  return {
+    firing: alerts.filter((a) => a.state === 'firing').length,
+    pending: alerts.filter((a) => a.state === 'pending').length,
+    rules: rules.find((r) => r.projectId === projectId).length,
+    silences: silences.find((s) => s.projectId === projectId && Date.parse(s.endsAt) > now).length,
+  };
 }
 
 export function compare(op: string, v: number, threshold: number): boolean {
@@ -468,11 +580,20 @@ function validateConfig(kind: ChannelKind, config: ChannelConfig) {
   }
 }
 
+/** Template fields channels saved by an older demo lack. */
+const CHANNEL_TEMPLATE_DEFAULTS = {
+  useEmoji: true,
+  templateOverride: false,
+  templateSubject: '',
+  templateBody: '',
+  templateError: '',
+};
+
 function settingsView(channel: StoredChannel): SettingsChannel {
   const { config, ...view } = channel;
   void config;
   const usedBy = rules.find((r) => r.channelIds.includes(channel.id)).length;
-  return { ...view, usedBy };
+  return { ...CHANNEL_TEMPLATE_DEFAULTS, ...view, usedBy };
 }
 
 const projectView = (channel: StoredChannel): NotificationChannel => ({
@@ -481,7 +602,109 @@ const projectView = (channel: StoredChannel): NotificationChannel => ({
   kind: channel.kind,
   target: channel.target,
   source: channel.source,
+  useEmoji: channel.useEmoji ?? true,
+  templateOverride: channel.templateOverride ?? false,
+  templateError: channel.templateError || undefined,
 });
+
+// --- message templates and incident notifications -----------------------------------------
+
+interface StoredTemplate extends MessageTemplate {
+  updatedAt: string;
+}
+
+/** The organisation's templates per channel kind; a kind not stored uses the built-in one. */
+export const messageTemplates = value<Partial<Record<ChannelKind, StoredTemplate>>>(
+  'messageTemplates',
+  () => ({
+    // Harborline tags the on-call group in Slack and links the runbook first.
+    slack: {
+      subject: '',
+      body:
+        '{{if eq .SeverityKey "critical" "high"}}{{if not .Test}}<!subteam^S0HARBORONCALL> {{end}}{{end}}' +
+        defaultTemplate('slack').body,
+      updatedAt: new Date(Date.now() - 12 * DAY).toISOString(),
+    },
+  }),
+);
+
+function templatesView(): MessageTemplatesView {
+  const saved = messageTemplates.get();
+  return {
+    managed: false,
+    templates: CHANNEL_KINDS.map((kind) => {
+      const builtIn = defaultTemplate(kind);
+      const stored = saved[kind];
+      return {
+        kind,
+        subject: stored?.subject ?? builtIn.subject,
+        body: stored?.body ?? builtIn.body,
+        isDefault: !stored,
+        defaultSubject: builtIn.subject,
+        defaultBody: builtIn.body,
+        updatedAt: stored?.updatedAt ?? null,
+        lastError: '',
+        lastErrorAt: null,
+      };
+    }),
+  };
+}
+
+/** A 400 listing every template problem, as the server answers. */
+function templateErrors(problems: TemplateProblem[]): Response {
+  const text = problems
+    .map((p) =>
+      p.line > 0 ? `${p.field}, line ${p.line}: ${p.message}` : `${p.field}: ${p.message}`,
+    )
+    .join('; ');
+  return new Response(JSON.stringify({ error: text, errors: problems }), {
+    status: 400,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+const requireKind = (kind: string): ChannelKind =>
+  CHANNEL_KINDS.includes(kind as ChannelKind)
+    ? (kind as ChannelKind)
+    : bad(`unknown channel kind "${kind}"`);
+
+const incidentSettings = collection<IncidentNotificationSettings & { id: string }>(
+  'incidentNotifications',
+  () => [
+    {
+      id: PROJECT_ID,
+      projectId: PROJECT_ID,
+      notifyOpen: true,
+      notifyEnd: true,
+      minSignals: 5,
+      minServices: 2,
+      severity: 'high',
+      channelIds: [CHANNEL_PLATFORM_SLACK, CHANNEL_WEBHOOK],
+      updatedAt: new Date(Date.now() - 9 * DAY).toISOString(),
+    },
+  ],
+);
+
+function incidentSettingsOf(projectId: string): IncidentNotificationSettings {
+  const stored = incidentSettings.get(projectId);
+  if (stored) {
+    const { id: _id, ...settings } = stored;
+    void _id;
+    // A deleted channel drops out, as the server's foreign keys do.
+    const known = new Set(channelsFor(projectId).map((c) => c.id));
+    return { ...settings, channelIds: settings.channelIds.filter((id) => known.has(id)) };
+  }
+  return {
+    projectId,
+    notifyOpen: false,
+    notifyEnd: false,
+    minSignals: 3,
+    minServices: 2,
+    severity: 'high',
+    channelIds: [],
+    updatedAt: null,
+  };
+}
 
 function ownedChannel(id: string): StoredChannel {
   const channel = channels.get(id);
@@ -501,6 +724,12 @@ export function register(r: Router) {
     return deriveAlerts(req.params.pid);
   });
 
+  r.get(`${project}/alerts/summary`, (req) => alertsSummary(requireProject(req.params.pid).id));
+
+  r.get(`${project}/alert-rules/activity`, (req) =>
+    ruleActivity(requireProject(req.params.pid).id),
+  );
+
   r.get(`${project}/alert-rules`, (req) => {
     requireProject(req.params.pid);
     const now = Date.now();
@@ -513,7 +742,14 @@ export function register(r: Router) {
   r.post(`${project}/alert-rules`, (req) => {
     requireProject(req.params.pid);
     const fields = applyRule(req.params.pid, (req.body ?? {}) as RuleRequest);
-    return withEval(rules.insert({ id: newId(), projectId: req.params.pid, ...fields }));
+    return withEval(
+      rules.insert({
+        id: newId(),
+        projectId: req.params.pid,
+        ...fields,
+        createdAt: new Date().toISOString(),
+      }),
+    );
   });
 
   r.post(`${project}/alert-rules/preview`, (req): PreviewSeries[] => {
@@ -554,6 +790,57 @@ export function register(r: Router) {
     const channel = channelsFor(req.params.pid).find((c) => c.id === req.params.channelId);
     if (!channel) throw new DemoError(404, 'channel not found');
     return { message: SENT('Test notification sent') };
+  });
+
+  r.get(`${project}/incident-notifications`, (req) =>
+    incidentSettingsOf(requireProject(req.params.pid).id),
+  );
+
+  r.put(`${project}/incident-notifications`, (req) => {
+    const projectId = requireProject(req.params.pid).id;
+    const body = (req.body ?? {}) as IncidentNotificationRequest;
+    const minSignals = Math.floor(Number(body.minSignals));
+    const minServices = Math.floor(Number(body.minServices));
+    if (!(minSignals >= 1 && minSignals <= 1000)) bad('minSignals must be between 1 and 1000');
+    if (!(minServices >= 1 && minServices <= 100)) bad('minServices must be between 1 and 100');
+    if (!SEVERITIES.includes(body.severity)) bad('severity must be critical, high, medium or low');
+    const channelIds = [...new Set(body.channelIds ?? [])];
+    const known = new Set(channelsFor(projectId).map((c) => c.id));
+    if (channelIds.some((id) => !known.has(id))) bad('every channel must belong to this project');
+    if ((body.notifyOpen || body.notifyEnd) && !channelIds.length)
+      bad('pick at least one channel to notify');
+    const settings = {
+      id: projectId,
+      projectId,
+      notifyOpen: !!body.notifyOpen,
+      notifyEnd: !!body.notifyEnd,
+      minSignals,
+      minServices,
+      severity: body.severity,
+      channelIds,
+      updatedAt: new Date().toISOString(),
+    };
+    if (incidentSettings.get(projectId)) incidentSettings.update(projectId, settings);
+    else incidentSettings.insert(settings);
+    return incidentSettingsOf(projectId);
+  });
+
+  r.post(`${project}/silences/:silenceId/expire`, (req) => {
+    requireProject(req.params.pid);
+    const silence = silences.get(req.params.silenceId);
+    if (!silence || silence.projectId !== req.params.pid)
+      throw new DemoError(404, 'silence not found');
+    if (silence.managedBy)
+      throw new DemoError(
+        409,
+        'this silence comes from a Synthetics maintenance window: change the window on the control plane',
+      );
+    const now = new Date();
+    if (Date.parse(silence.endsAt) <= now.getTime())
+      throw new DemoError(409, 'this silence is already over');
+    const startsAt =
+      Date.parse(silence.startsAt) > now.getTime() ? now.toISOString() : silence.startsAt;
+    return silences.update(silence.id, { startsAt, endsAt: now.toISOString() });
   });
 
   r.get(`${project}/silences`, (req) => {
@@ -653,7 +940,9 @@ export function register(r: Router) {
 
   r.post('/settings/channels', (req) => {
     const fields = channelFields((req.body ?? {}) as SettingsChannelRequest);
-    return centralView(channels.insert({ id: newId(), source: 'central', ...fields }));
+    return centralView(
+      channels.insert({ id: newId(), source: 'central', ...CHANNEL_TEMPLATE_DEFAULTS, ...fields }),
+    );
   });
 
   r.put('/settings/channels/:channelId', (req) => {
@@ -675,6 +964,72 @@ export function register(r: Router) {
   r.post('/settings/channels/:channelId/test', (req) => {
     ownedChannel(req.params.channelId);
     return { message: SENT('Test notification sent') };
+  });
+
+  r.put('/settings/channels/:channelId/template', (req) => {
+    const existing = ownedChannel(req.params.channelId);
+    const body = (req.body ?? {}) as ChannelTemplateRequest;
+    let subject = '';
+    let template = '';
+    if (!body.useOrgDefault) {
+      subject = existing.kind === 'email' ? (body.subject ?? '') : '';
+      template = body.body ?? '';
+      const problems = validateTemplate(existing.kind, { subject, body: template });
+      if (problems.length) return templateErrors(problems);
+    }
+    const updated = channels.update(existing.id, {
+      useEmoji: body.useEmoji !== false,
+      templateOverride: !body.useOrgDefault,
+      templateSubject: subject,
+      templateBody: template,
+      templateError: '',
+      templateErrorAt: null,
+      updatedAt: new Date().toISOString(),
+    })!;
+    return centralView(updated);
+  });
+
+  // --- message templates ------------------------------------------------------------------
+  r.get('/settings/message-templates', () => templatesView());
+  r.post('/settings/message-templates/preview', (req) => {
+    const body = (req.body ?? {}) as TemplatePreviewRequest;
+    const kind = requireKind(body.kind);
+    return previewTemplate(
+      kind,
+      { subject: body.subject ?? '', body: body.body ?? '' },
+      body.useEmoji !== false,
+    );
+  });
+  r.post('/settings/message-templates/test', (req) => {
+    const body = (req.body ?? {}) as TemplatePreviewRequest & { channelId?: string };
+    const kind = requireKind(body.kind);
+    const channel = ownedChannel(body.channelId ?? '');
+    if (channel.kind !== kind) bad(`choose a ${kind} channel to test a ${kind} template`);
+    const problems = validateTemplate(kind, { subject: body.subject ?? '', body: body.body ?? '' });
+    if (problems.length) return templateErrors(problems);
+    return { message: SENT(`Test sent to ${channel.name}`) };
+  });
+  r.put('/settings/message-templates/:kind', (req) => {
+    const kind = requireKind(req.params.kind);
+    const body = (req.body ?? {}) as MessageTemplate;
+    const template = {
+      subject: kind === 'email' ? (body.subject ?? '') : '',
+      body: body.body ?? '',
+    };
+    const problems = validateTemplate(kind, template);
+    if (problems.length) return templateErrors(problems);
+    messageTemplates.set({
+      ...messageTemplates.get(),
+      [kind]: { ...template, updatedAt: new Date().toISOString() },
+    });
+    return templatesView();
+  });
+  r.delete('/settings/message-templates/:kind', (req) => {
+    const kind = requireKind(req.params.kind);
+    const next = { ...messageTemplates.get() };
+    delete next[kind];
+    messageTemplates.set(next);
+    return templatesView();
   });
 
   r.get('/settings/smtp', () => {

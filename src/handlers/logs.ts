@@ -1,7 +1,7 @@
 // Logs: search (plain and streamed), facets, patterns, anomalies, deploy
 // markers, context, live tail and the log-source panel aggregation the
 // histogram and dashboards use. SQL mode lives in ./sql.
-import type { AggregationBucket, Panel } from '../../entity/dashboards';
+import type { AggregationBucket, LogMeasure, Panel } from '../../entity/dashboards';
 import type {
   DeploysRequest,
   FieldValuesRequest,
@@ -16,10 +16,12 @@ import {
   type GenLog,
   SLOT_MS,
   countLogs,
+  isTimelessPanel,
   logById,
   patternHashOf,
   sampleMessage,
   slotLogs,
+  slotMean,
   slotOf,
   templateFor,
   toLogItem,
@@ -30,7 +32,7 @@ import { probeRunLogs } from '../gen/synthetics';
 import { goDuration, ndjson, sleep } from '../lib/http';
 import { fieldValue, matcher, normalizeField } from '../query/evalNode';
 import { DemoError, type Router } from '../router';
-import { PROJECT_ID, WORKLOADS, dataStart, deploysFor, podsFor } from '../world';
+import { DATA_DAYS, PROJECT_ID, WORKLOADS, dataStart, deploysFor, podsFor } from '../world';
 import { requireProject } from './bootstrap';
 import { registerSql } from './sql';
 
@@ -111,12 +113,65 @@ function search(projectId: string, req: LogQueryRequest): SearchResult {
 
 // --- aggregation (histogram + logs panels) ------------------------------------
 
-const groupKeyOf = (field: string | undefined) => {
-  if (!field) return undefined;
-  return (log: GenLog) => fieldValue(log, field) ?? '';
-};
+/** A numeric field's 1-2-5 log band, keyed by its lower bound like the backend ("0" for <= 0). */
+export function logBand(value: number): string {
+  if (value <= 0) return '0';
+  const decade = Math.pow(10, Math.floor(Math.log10(value) + 1e-9));
+  const factor = value >= 5 * decade ? 5 : value >= 2 * decade ? 2 : 1;
+  return String(Number((decade * factor).toPrecision(12)));
+}
 
-/** A logs-source panel's buckets: counts per time bucket (and group). */
+interface MeasureAcc {
+  count: number;
+  sum: number;
+  n: number;
+  min: number;
+  max: number;
+  values: number[];
+  distinct: Set<string>;
+}
+
+const newAcc = (): MeasureAcc => ({
+  count: 0,
+  sum: 0,
+  n: 0,
+  min: Infinity,
+  max: -Infinity,
+  values: [],
+  distinct: new Set(),
+});
+
+const round2 = (v: number) => Math.round(v * 100) / 100;
+
+function measureValue(measure: LogMeasure, acc: MeasureAcc): number | undefined {
+  switch (measure) {
+    case 'count':
+      return Math.round(acc.count);
+    case 'distinct':
+      return acc.distinct.size;
+    case 'sum':
+      return round2(acc.sum);
+    case 'avg':
+      return acc.n ? round2(acc.values.reduce((a, b) => a + b, 0) / acc.n) : undefined;
+    case 'min':
+      return acc.n ? round2(acc.min) : undefined;
+    case 'max':
+      return acc.n ? round2(acc.max) : undefined;
+    default: {
+      if (!acc.n) return undefined;
+      const p = measure === 'p50' ? 0.5 : measure === 'p95' ? 0.95 : 0.99;
+      const sorted = [...acc.values].sort((a, b) => a - b);
+      return round2(sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]);
+    }
+  }
+}
+
+/**
+ * A logs-source panel's buckets: per time bucket (or one total for the
+ * summary kinds) and group, the panel's measure (line count by default)
+ * over measureField; topGroups keeps a series' N largest groups and
+ * groupBands groups a numeric groupField into 1-2-5 log bands.
+ */
 export function aggregateLogPanel(
   projectId: string,
   panel: Panel,
@@ -128,51 +183,120 @@ export function aggregateLogPanel(
   const bucketMs =
     panel.bucketMs && panel.bucketMs >= 1000 ? Math.max(panel.bucketMs, SLOT_MS) : auto;
   const predicate = matcher(panel.query);
-  const timeless = panel.type === 'pie' || panel.type === 'stat' || panel.type === 'table';
-  const counts = countLogs(
-    projectId,
-    from,
-    to,
-    timeless ? span + 1 : bucketMs,
-    predicate,
-    groupKeyOf(panel.groupField),
-  );
+  const timeless = isTimelessPanel(panel);
+  const measure: LogMeasure = panel.measure ?? 'count';
+  const measureField = panel.measureField ?? '';
+  const numeric = measure !== 'count' && measure !== 'distinct';
+  const groupField = panel.groupField;
+  const bands = panel.groupBands === 'log' && !!groupField;
+  const keyOf = (log: GenLog): string | undefined => {
+    if (!groupField) return '';
+    const raw = fieldValue(log, groupField);
+    if (!bands) return raw ?? '';
+    const value = Number(raw);
+    return raw === undefined || raw === '' || !Number.isFinite(value) ? undefined : logBand(value);
+  };
+
+  const now = Date.now();
+  const width = timeless ? span + 1 : bucketMs;
+  const start = Math.max(from, dataStart(now));
+  const end = Math.min(to, now);
+  const accs = new Map<number, Map<string, MeasureAcc>>();
+  const firstBucket = timeless ? from : Math.floor(start / width) * width;
+  for (let bucket = firstBucket; bucket <= (timeless ? from : end); bucket += width) {
+    const groups = new Map<string, MeasureAcc>();
+    accs.set(bucket, groups);
+    const bucketStart = Math.max(bucket, start);
+    const bucketEnd = Math.min(bucket + width - 1, end);
+    if (bucketStart > bucketEnd) continue;
+    const firstSlot = slotOf(bucketStart);
+    const lastSlot = slotOf(bucketEnd);
+    const step = Math.max(1, Math.floor((lastSlot - firstSlot + 1) / 24));
+    let sampledMean = 0;
+    let fullMean = 0;
+    for (let s = firstSlot; s <= lastSlot; s++) fullMean += slotMean(s, projectId);
+    const seen: { log: GenLog; key: string }[] = [];
+    for (let s = firstSlot; s <= lastSlot; s += step) {
+      sampledMean += slotMean(s, projectId);
+      for (const log of slotLogs(s, projectId, now)) {
+        if (log.ts < bucketStart || log.ts > bucketEnd || !predicate(log)) continue;
+        const key = keyOf(log);
+        if (key !== undefined) seen.push({ log, key });
+      }
+    }
+    const weight = step === 1 || sampledMean === 0 ? 1 : fullMean / sampledMean;
+    for (const { log, key } of seen) {
+      let acc = groups.get(key);
+      if (measure !== 'count') {
+        const raw = fieldValue(log, measureField);
+        if (raw === undefined || raw === '') continue;
+        const value = Number(raw);
+        if (numeric && !Number.isFinite(value)) continue;
+        if (!acc) groups.set(key, (acc = newAcc()));
+        acc.count += weight;
+        if (measure === 'distinct') acc.distinct.add(raw);
+        else {
+          acc.sum += value * weight;
+          acc.n++;
+          acc.min = Math.min(acc.min, value);
+          acc.max = Math.max(acc.max, value);
+          acc.values.push(value);
+        }
+        continue;
+      }
+      if (!acc) groups.set(key, (acc = newAcc()));
+      acc.count += weight;
+    }
+  }
+
   const buckets: AggregationBucket[] = [];
+  const label = (key: string) => (bands ? key : key || '(empty)');
   if (timeless) {
-    const totals = new Map<string, number>();
-    for (const groups of counts.values()) {
-      for (const [key, count] of groups) totals.set(key, (totals.get(key) ?? 0) + count);
-    }
-    const sorted = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, panel.limit || 20);
-    for (const [key, count] of sorted) {
+    const groups = accs.get(firstBucket) ?? new Map<string, MeasureAcc>();
+    const rows = [...groups.entries()]
+      .map(([key, acc]) => ({ key, value: measureValue(measure, acc), size: acc.count }))
+      .filter((row): row is { key: string; value: number; size: number } => row.value !== undefined)
+      .sort((a, b) => b.value - a.value)
+      .slice(0, panel.limit || 20);
+    for (const row of rows)
       buckets.push(
-        panel.groupField ? { groupKey: key || '(empty)', value: count } : { value: count },
+        groupField ? { groupKey: label(row.key), value: row.value } : { value: row.value },
       );
-    }
-    if (!sorted.length && !panel.groupField) buckets.push({ value: 0 });
+    if (!rows.length && !groupField && measure === 'count') buckets.push({ value: 0 });
     return buckets;
   }
-  // Keep the top groups by total so a high-cardinality field stays readable.
-  const totals = new Map<string, number>();
-  for (const groups of counts.values())
-    for (const [k, c] of groups) totals.set(k, (totals.get(k) ?? 0) + c);
+  // Keep the largest groups (by lines) so a high-cardinality field stays readable.
+  const sizes = new Map<string, number>();
+  for (const groups of accs.values())
+    for (const [k, acc] of groups) sizes.set(k, (sizes.get(k) ?? 0) + acc.count);
   const keep = new Set(
-    [...totals.entries()]
+    [...sizes.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, panel.limit || 10)
+      .slice(0, panel.topGroups || panel.limit || (bands ? 50 : 10))
       .map(([k]) => k),
   );
-  for (const [bucket, groups] of counts) {
+  for (const [bucket, groups] of accs) {
     const timestamp = new Date(bucket).toISOString();
-    if (!panel.groupField) {
-      buckets.push({ timestamp, value: groups.get('') ?? 0 });
+    if (!groupField) {
+      const acc = groups.get('');
+      const value = acc ? measureValue(measure, acc) : measure === 'count' ? 0 : undefined;
+      if (value !== undefined) buckets.push({ timestamp, value });
       continue;
     }
-    for (const [key, count] of groups) {
-      if (keep.has(key)) buckets.push({ timestamp, groupKey: key || '(empty)', value: count });
+    for (const [key, acc] of groups) {
+      if (!keep.has(key)) continue;
+      const value = measureValue(measure, acc);
+      if (value !== undefined) buckets.push({ timestamp, groupKey: label(key), value });
     }
   }
   return buckets;
+}
+
+/** Whether a query reads the message text (raw logs only, no per-minute counts). */
+export function searchesMessage(node: QueryNode | null | undefined): boolean {
+  if (!node) return false;
+  if (node.type === 'condition') return node.condition?.field === 'message';
+  return (node.logic?.children ?? []).some(searchesMessage);
 }
 
 // --- facets -----------------------------------------------------------------
@@ -227,6 +351,24 @@ function facet(
     for (const entry of counts.values()) entry.count = Math.round(entry.count * scale);
   return { counts, matched, sampledFrom };
 }
+
+/** A project's stored logs: counts and sizes since the demo's data start. */
+export const logStats = (projectId: string) => {
+  const now = Date.now();
+  const oldest = dataStart(now);
+  const total = totalLogs(projectId, oldest, now, () => true);
+  const rawMb = (total * 310) / 1024 / 1024;
+  const storedMb = Math.round(rawMb * 0.11 * 10) / 10;
+  return {
+    totalLogs: total,
+    totalSizeMb: storedMb,
+    // Fresh segments (about the last two hours) are still on local disk.
+    objectStorageSizeMb: Math.round(storedMb * (1 - 2 / (DATA_DAYS * 24)) * 10) / 10,
+    rawSizeMb: Math.round(rawMb * 10) / 10,
+    oldestLogTime: new Date(oldest).toISOString(),
+    newestLogTime: new Date(now - 1500).toISOString(),
+  };
+};
 
 // --- live tail --------------------------------------------------------------
 
@@ -439,7 +581,20 @@ export function register(r: Router) {
       (a, b) => (b.change === 'new' ? 1 : 0) - (a.change === 'new' ? 1 : 0) || b.ratio - a.ratio,
     );
     const sum = (m: Map<string, number>) => [...m.values()].reduce((s, v) => s + v, 0);
+    const counts = {
+      newCount: changes.filter((c) => c.change === 'new').length,
+      spikeCount: changes.filter((c) => c.change === 'spike').length,
+      dropCount: changes.filter((c) => c.change === 'drop').length,
+      counted: true,
+    };
+    if (body.countOnly) {
+      // Like the server: per-minute counts can't answer a message search.
+      if (searchesMessage(body.query))
+        return { changes: [], currentTotal: 0, baselineTotal: 0, counted: false };
+      return { changes: [], currentTotal: sum(cur), baselineTotal: sum(base), ...counts };
+    }
     return {
+      ...counts,
       changes: changes
         .slice(0, body.limit ?? 20)
         .map(({ template, ...rest }) => ({ ...rest, hash: patternHashOf(template.id) })),
@@ -630,23 +785,10 @@ export function register(r: Router) {
     return { fields };
   });
 
-  const stats = (projectId: string) => {
-    const now = Date.now();
-    const oldest = dataStart(now);
-    const total = totalLogs(projectId, oldest, now, () => true);
-    const rawMb = (total * 310) / 1024 / 1024;
-    return {
-      totalLogs: total,
-      totalSizeMb: Math.round(rawMb * 0.11 * 10) / 10,
-      rawSizeMb: Math.round(rawMb * 10) / 10,
-      oldestLogTime: new Date(oldest).toISOString(),
-      newestLogTime: new Date(now - 1500).toISOString(),
-    };
-  };
-  r.get('/logs/query/stats/:pid', (req) => stats(requireProject(req.params.pid).id));
-  r.get('/logs/query/system-stats', () => stats(PROJECT_ID));
+  r.get('/logs/query/stats/:pid', (req) => logStats(requireProject(req.params.pid).id));
+  r.get('/logs/query/system-stats', () => logStats(PROJECT_ID));
   r.get('/logs/query/system-dashboard', () => {
-    const base = stats(PROJECT_ID);
+    const base = logStats(PROJECT_ID);
     const perMin = Math.round(144 * (0.8 + Math.random() * 0.3));
     return {
       ...base,

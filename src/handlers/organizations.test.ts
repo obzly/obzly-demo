@@ -26,10 +26,11 @@ import { register as admin } from './admin';
 import { call, routerWith } from './admin.testkit';
 import { register as aiUsage } from './aiUsage';
 import { register as bootstrap } from './bootstrap';
+import { register as ingestion } from './ingestion';
 import { register } from './organizations';
 import { register as sites } from './sites';
 
-const router = routerWith(bootstrap, register, admin, sites, aiUsage);
+const router = routerWith(bootstrap, register, admin, sites, aiUsage, ingestion);
 
 describe('demo organizations', () => {
   beforeEach(() => resetDemo());
@@ -223,7 +224,10 @@ describe('demo route coverage for the admin and AI areas', () => {
   ];
   const sample = (template: string) =>
     template
-      .replace(/\$\{[^}]*\}/g, 'x')
+      // An interpolated query string (`${refresh ? '?refresh=true' : ''}`) isn't a segment.
+      .replace(/\$\{[^}]*\}/g, (_m, offset: number, whole: string) =>
+        offset > 0 && whole[offset - 1] !== '/' ? '' : 'x',
+      )
       .replace(/\?.*$/, '')
       .replace(/^x?\/api\/v1/, '')
       .replace(/^x\/sites\/x\/api\/v1/, '')

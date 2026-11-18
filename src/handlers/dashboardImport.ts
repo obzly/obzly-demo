@@ -87,7 +87,9 @@ function unitOf(unit: string): Panel['unit'] {
 
 // --- Grafana --------------------------------------------------------------------------
 
-function grafanaType(type: string): Panel['type'] | undefined {
+/** Like the server: a v2 kind only where it is a clean match. */
+function grafanaType(type: string, raw: Json): Panel['type'] | undefined {
+  const options = isObject(raw.options) ? raw.options : {};
   switch (type) {
     case 'timeseries':
     case 'graph':
@@ -95,22 +97,83 @@ function grafanaType(type: string): Panel['type'] | undefined {
     case 'xychart':
       return 'line';
     case 'barchart':
-    case 'bargauge':
     case 'histogram':
-    case 'state-timeline':
       return 'bar';
+    case 'bargauge':
+      return 'rankedList';
     case 'piechart':
-      return 'pie';
+      return options.pieType === 'donut' ? 'donut' : 'pie';
     case 'stat':
+      return options.graphMode === 'area' ? 'statTrend' : 'stat';
     case 'singlestat':
+      return isObject(raw.sparkline) && raw.sparkline.show === true ? 'statTrend' : 'stat';
     case 'gauge':
-      return 'stat';
+      return 'gauge';
+    case 'status-history':
+    case 'state-timeline':
+      return 'statusStrip';
     case 'table':
     case 'table-old':
     case 'logs':
       return 'table';
     default:
       return undefined;
+  }
+}
+
+const colorLevel = (color: string) => {
+  const c = color.toLowerCase();
+  if (c.includes('red')) return 'critical';
+  if (c.includes('orange') || c.includes('yellow')) return 'warn';
+  if (c.includes('green')) return 'ok';
+  return 'unknown';
+};
+
+/**
+ * fieldConfig.defaults the v2 kinds share (the server's applyGrafanaFieldDefaults):
+ * a gauge's min/max and absolute thresholds whose colours say which step is
+ * warn and which critical. Anything else is left out rather than failing.
+ */
+function applyGrafanaDefaults(panel: Panel, defaults: Json) {
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  if (panel.type === 'gauge') {
+    const min = num(defaults.min);
+    const max = num(defaults.max);
+    if (min === undefined || max === undefined || min < max) {
+      if (min !== undefined) panel.min = min;
+      if (max !== undefined) panel.max = max;
+    }
+  }
+  if (panel.type !== 'gauge' && panel.type !== 'statusStrip') return;
+  const thresholds = isObject(defaults.thresholds) ? defaults.thresholds : {};
+  if (thresholds.mode !== undefined && thresholds.mode !== 'absolute') return;
+  const steps = arr(thresholds.steps).filter(isObject);
+  if (steps.length < 2 || steps.length > 3) return;
+  const values = steps.map((step) => num(step.value));
+  if (values.slice(1).some((v) => v === undefined)) return;
+  const v = values as number[];
+  switch (steps.map((step) => colorLevel(str(step.color))).join(',')) {
+    case 'ok,warn':
+      panel.thresholds = { warn: v[1] };
+      break;
+    case 'ok,critical':
+      panel.thresholds = { critical: v[1] };
+      break;
+    case 'ok,warn,critical':
+      panel.thresholds = { warn: v[1], critical: v[2] };
+      break;
+    case 'critical,ok':
+      panel.thresholds = { critical: v[1] };
+      panel.higherIs = 'good';
+      break;
+    case 'warn,ok':
+      panel.thresholds = { warn: v[1] };
+      panel.higherIs = 'good';
+      break;
+    case 'critical,warn,ok':
+      panel.thresholds = { warn: v[2], critical: v[1] };
+      panel.higherIs = 'good';
+      break;
   }
 }
 
@@ -158,7 +221,7 @@ export function lokiToQuery(expr: string): { query?: QueryNode; dropped: boolean
 function grafanaPanel(raw: Json, warnings: string[], yOffset: number): Panel | undefined {
   const title = str(raw.title, 'Untitled panel');
   const sourceType = str(raw.type);
-  const type = grafanaType(sourceType);
+  const type = grafanaType(sourceType, raw);
   if (!type) {
     warnings.push(`"${title}": ${sourceType || 'unknown'} panels aren't supported, skipped`);
     return undefined;
@@ -173,6 +236,7 @@ function grafanaPanel(raw: Json, warnings: string[], yOffset: number): Panel | u
     isObject(raw.fieldConfig) && isObject(raw.fieldConfig.defaults) ? raw.fieldConfig.defaults : {};
   const unit = unitOf(str(defaults.unit));
   if (unit) panel.unit = unit;
+  applyGrafanaDefaults(panel, defaults);
 
   const targets = arr(raw.targets)
     .filter(isObject)
@@ -308,15 +372,18 @@ function openObserveType(type: string): Panel['type'] | undefined {
       return 'line';
     case 'bar':
     case 'h-bar':
-    case 'stacked':
     case 'h-stacked':
       return 'bar';
+    case 'stacked':
+      return 'stackedBar';
     case 'pie':
-    case 'donut':
       return 'pie';
+    case 'donut':
+      return 'donut';
     case 'metric':
-    case 'gauge':
       return 'stat';
+    case 'gauge':
+      return 'gauge';
     case 'table':
       return 'table';
     default:

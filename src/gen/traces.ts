@@ -39,7 +39,7 @@ import {
   SONNET,
   llmSpansBetween,
 } from './aiUsage';
-import { type GenLog, SLOT_MS, slotLogs, slotMean, slotOf } from './logs';
+import { type GenLog, SLOT_MS, isTimelessPanel, slotLogs, slotMean, slotOf } from './logs';
 
 const HOUR = 3_600_000;
 /** Share of requests where a cache call times out (handled: the request still succeeds). */
@@ -1938,9 +1938,12 @@ export function spanStats(projectId: string, now = Date.now()) {
   const { tracesPerLog, spansPerTrace } = ratios();
   const totalSpans = Math.round(logs * tracesPerLog * spansPerTrace);
   const rawMb = (totalSpans * 640) / 1024 / 1024;
+  const storedMb = Math.round(rawMb * 0.13 * 10) / 10;
   return {
     totalSpans,
-    totalSizeMb: Math.round(rawMb * 0.13 * 10) / 10,
+    totalSizeMb: storedMb,
+    // The last couple of hours' segments are still on local disk.
+    objectStorageSizeMb: Math.round(storedMb * (1 - (2 * HOUR) / (now - oldest)) * 10) / 10,
     rawSizeMb: Math.round(rawMb * 10) / 10,
     oldestSpanTime: new Date(oldest).toISOString(),
     newestSpanTime: new Date(now - 2500).toISOString(),
@@ -2012,7 +2015,7 @@ export function aggregateSpanPanel(
   const auto = Math.max(SLOT_MS, Math.ceil(span / 120 / SLOT_MS) * SLOT_MS);
   const bucketMs =
     panel.bucketMs && panel.bucketMs >= 1000 ? Math.max(panel.bucketMs, SLOT_MS) : auto;
-  const timeless = panel.type === 'pie' || panel.type === 'stat' || panel.type === 'table';
+  const timeless = isTimelessPanel(panel);
   const width = timeless ? span + 1 : bucketMs;
   const groupOf = panel.groupField ? GROUP_KEY[panel.groupField] : undefined;
   const matches = (s: GenSpan) =>

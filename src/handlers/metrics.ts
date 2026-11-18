@@ -99,6 +99,8 @@ function stats(projectId: string) {
   return {
     totalSamples: samples,
     totalSizeMb: mb(samples * 1.37),
+    // The last couple of hours' segments are still on local disk.
+    objectStorageSizeMb: mb(samples * 1.37 * (1 - (2 * 3_600_000) / (now - oldest))),
     rawSizeMb: mb(samples * 16),
     oldestSampleTime: new Date(oldest).toISOString(),
     newestSampleTime: new Date(now - 12_000).toISOString(),
