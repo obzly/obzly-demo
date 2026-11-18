@@ -196,6 +196,90 @@ function runs(projects: string[]): SeedRun[] {
   return runSeed().filter((run) => projects.includes(run.projectId));
 }
 
+/**
+ * Per standard, where its results come from (the server's sourceReasons): in
+ * how many scopes the native service is read, where the Obzly baseline
+ * stands in and why, and where neither does.
+ */
+function sourceReasons(projects: string[]): Map<string, string> {
+  interface Scope {
+    provider: string;
+    region: string;
+    nativeOK: boolean;
+    baselineOK: boolean;
+    triedNative: boolean;
+    reason: string;
+  }
+  const byStandard = new Map<string, Map<string, Scope>>();
+  for (const run of runs(projects)) {
+    const scopes = byStandard.get(run.standard) ?? new Map<string, Scope>();
+    byStandard.set(run.standard, scopes);
+    const key = `${run.connectionId}|${run.account}|${run.region}`;
+    const scope = scopes.get(key) ?? {
+      provider: run.provider,
+      region: run.region,
+      nativeOK: false,
+      baselineOK: false,
+      triedNative: false,
+      reason: '',
+    };
+    scopes.set(key, scope);
+    const ok = run.result === 'ok';
+    if (run.source === 'native') {
+      scope.triedNative = true;
+      scope.nativeOK ||= ok;
+    } else scope.baselineOK ||= ok;
+    if (!ok && !scope.reason) scope.reason = run.reason ?? '';
+  }
+  const mostCommon = (reasons: string[]) => {
+    const counts = new Map<string, number>();
+    for (const r of reasons) if (r) counts.set(r, (counts.get(r) ?? 0) + 1);
+    return (
+      [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? ''
+    );
+  };
+  const out = new Map<string, string>();
+  for (const [standard, map] of byStandard) {
+    const scopes = [...map.values()];
+    const providers = new Set(scopes.map((sc) => sc.provider));
+    const [service, unit] =
+      providers.size === 1 && providers.has('aws')
+        ? ['Security Hub', 'region']
+        : providers.size === 1 && providers.has('azure')
+          ? ['Defender for Cloud', 'subscription']
+          : ['the native service', 'scope'];
+    const places = (list: Scope[]) => {
+      if (unit === 'region') {
+        const names = [...new Set(list.map((sc) => sc.region))].sort();
+        if (names.length <= 3) return names.join(', ');
+      }
+      return list.length === 1 ? `1 ${unit}` : `${list.length} ${unit}s`;
+    };
+    const native = scopes.filter((sc) => sc.nativeOK).length;
+    const baseline = scopes.filter((sc) => !sc.nativeOK && sc.baselineOK);
+    const uncovered = scopes.filter((sc) => !sc.nativeOK && !sc.baselineOK);
+    const triedNative = scopes.some((sc) => sc.triedNative);
+    const parts: string[] = [];
+    if (native === scopes.length) parts.push(`${service} in every scanned ${unit}`);
+    else if (native > 0) parts.push(`${service} in ${native} of ${scopes.length} ${unit}s`);
+    if (baseline.length) {
+      const why = mostCommon(baseline.filter((sc) => sc.triedNative).map((sc) => sc.reason));
+      if (native === 0 && !uncovered.length && why)
+        parts.push(`Obzly baseline: ${why} in ${places(baseline)}`);
+      else if (native === 0 && !uncovered.length && !triedNative)
+        parts.push(`Obzly baseline checks in every scanned ${unit}`);
+      else if (why) parts.push(`Obzly baseline in ${places(baseline)} (${why})`);
+      else parts.push(`Obzly baseline in ${places(baseline)}`);
+    }
+    if (uncovered.length) {
+      const why = mostCommon(uncovered.map((sc) => sc.reason));
+      parts.push(`not covered in ${places(uncovered)}${why ? ` (${why})` : ''}`);
+    }
+    out.set(standard, parts.join('; '));
+  }
+  return out;
+}
+
 function scores(
   projects: string[],
   open: Finding[],
@@ -304,7 +388,12 @@ function summary(projects: string[], now = Date.now()): PostureSummary {
   const all = findings(projects, now);
   const standards = scores(projects, all);
   const trends = trendOf(projects, all, now);
-  for (const s of standards) s.trend = trends.get(s.standard);
+  const reasons = sourceReasons(projects);
+  for (const s of standards) {
+    s.trend = trends.get(s.standard);
+    const reason = reasons.get(s.standard);
+    if (reason) s.reason = reason;
+  }
   const open: PostureSummary['open'] = {};
   let suppressed = 0;
   for (const f of all) {

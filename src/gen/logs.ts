@@ -903,3 +903,13 @@ export function sampleMessage(templateId: string, t = Date.now()): string {
   const r = rng(hashString(templateId));
   return template.render({ r, t, incident: 1, traceId: traceIdAt(t, 1) }).message;
 }
+
+const TIMELESS_PANELS = new Set(['pie', 'stat', 'table', 'rankedList', 'donut', 'gauge']);
+
+/**
+ * Whether a panel query is one total (per group) rather than a time series:
+ * the summary kinds, and a stat with trend's un-bucketed total (the UI sends
+ * no bucketMs for that one).
+ */
+export const isTimelessPanel = (panel: { type: string; bucketMs?: number }) =>
+  TIMELESS_PANELS.has(panel.type) || (panel.type === 'statTrend' && !(panel.bucketMs! > 0));

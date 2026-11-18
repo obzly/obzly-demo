@@ -12,7 +12,14 @@ import type {
   PostureSettings,
   UseResult,
 } from '../../entity/cloud';
-import type { Asset, AssetDetail } from '../../entity/inventory';
+import type {
+  Asset,
+  AssetDetail,
+  AssetHealth,
+  AssetKind,
+  InventoryHistory,
+  InventorySummary,
+} from '../../entity/inventory';
 import {
   changesBetween,
   inventoryAssets,
@@ -53,6 +60,56 @@ const list = (value: string | null) =>
     .filter(Boolean);
 
 // --- inventory ----------------------------------------------------------------------
+
+/** Kinds whose count moves hour to hour: rollouts surge pods and containers, the rest is steady. */
+const CHURN: Partial<Record<AssetKind, number>> = {
+  pod: 0.12,
+  container: 0.12,
+  docker_container: 0.05,
+};
+
+/** The last 7 days' hourly counts by kind, and the counts by kind and health 24 h ago. */
+function historyOf(summary: InventorySummary, now = Date.now()): InventoryHistory {
+  const HOUR = 3_600_000;
+  const thisHour = Math.floor(now / HOUR) * HOUR;
+  const hours: number[] = [];
+  for (let h = thisHour - 167 * HOUR; h <= thisHour; h += HOUR) hours.push(h);
+  const kinds: Partial<Record<AssetKind, number[]>> = {};
+  const previous: Partial<Record<AssetKind, Partial<Record<AssetHealth, number>>>> = {};
+  const previousAt = thisHour - 24 * HOUR;
+  for (const [kind, byHealth] of Object.entries(summary.kinds) as [
+    AssetKind,
+    Partial<Record<AssetHealth, number>>,
+  ][]) {
+    const total = Object.values(byHealth).reduce((a, b) => a + (b ?? 0), 0);
+    const churn = CHURN[kind] ?? 0;
+    const at = (h: number) => {
+      if (h === thisHour || !churn) return total;
+      const roll = (mix(hashString(kind), h / HOUR) % 1000) / 1000;
+      // A rollout now and then adds a surge of new pods next to the old ones.
+      const surge = roll > 0.93 ? Math.round(total * churn) : 0;
+      return Math.max(0, total + surge - (roll < 0.1 ? 1 : 0));
+    };
+    kinds[kind] = hours.map(at);
+    const then = at(previousAt);
+    const scale = total ? then / total : 1;
+    const health: Partial<Record<AssetHealth, number>> = {};
+    for (const [state, count] of Object.entries(byHealth) as [AssetHealth, number][])
+      health[state] = Math.round(count * scale);
+    // A day ago one of the warnings wasn't there yet.
+    if ((health.warning ?? 0) > 0 && hashString(kind) % 2 === 0) {
+      health.warning = (health.warning ?? 0) - 1;
+      health.healthy = (health.healthy ?? 0) + 1;
+    }
+    previous[kind] = health;
+  }
+  return {
+    hours: hours.map((h) => new Date(h).toISOString()),
+    kinds,
+    previousAt: new Date(previousAt).toISOString(),
+    previous,
+  };
+}
 
 function filtered(req: DemoRequest): Asset[] {
   const q = req.query;
@@ -505,7 +562,12 @@ const body = <T>(req: DemoRequest) => (req.body ?? {}) as T;
 
 export function register(r: Router) {
   // The inventory (a Site's; a control plane reads it through /sites/:id, any id here).
-  r.get('/inventory/summary', (req) => summarize(filtered(req)));
+  r.get('/inventory/summary', (req) => {
+    const summary = summarize(filtered(req));
+    return req.query.get('history') === 'true'
+      ? { ...summary, history: historyOf(summary) }
+      : summary;
+  });
   r.get('/inventory/assets', (req) => {
     const assets = sortAssets(filtered(req));
     const limit = clamp(req.query.get('limit'), 2000, 5000);

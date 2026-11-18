@@ -5,7 +5,9 @@ import { register as alerting } from './alerting';
 import { register as bootstrap } from './bootstrap';
 import { register as cost } from './cost';
 import { register as dashboards } from './dashboards';
+import { register as ingestion } from './ingestion';
 import { register as inventory } from './inventory';
+import { register as logInsights } from './logInsights';
 import { register as logs } from './logs';
 import { register as metrics } from './metrics';
 import { register as organizations } from './organizations';
@@ -15,6 +17,7 @@ import { register as serviceMap } from './serviceMap';
 import { register as sites } from './sites';
 import { register as synthetics } from './synthetics';
 import { register as traces } from './traces';
+import { register as webAnalytics } from './webAnalytics';
 
 /** Every area's routes; each area lives in its own file. */
 export function buildRouter(): Router {
@@ -22,6 +25,8 @@ export function buildRouter(): Router {
   for (const register of [
     bootstrap,
     logs,
+    logInsights,
+    webAnalytics,
     traces,
     metrics,
     serviceMap,
@@ -29,6 +34,7 @@ export function buildRouter(): Router {
     alerting,
     synthetics,
     inventory,
+    ingestion,
     cost,
     posture,
     savedViews,

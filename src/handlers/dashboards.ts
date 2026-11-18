@@ -39,7 +39,76 @@ const MAX_TABS = 50;
 const MAX_PANELS = 500;
 const MAX_VARIABLES = 50;
 const MAX_TEXT_BYTES = 64 << 10;
-const PANEL_TYPES = new Set(['line', 'bar', 'pie', 'stat', 'table']);
+const PANEL_TYPES = new Set([
+  'line',
+  'bar',
+  'pie',
+  'stat',
+  'table',
+  'statTrend',
+  'rankedList',
+  'donut',
+  'gauge',
+  'stackedBar',
+  'statusStrip',
+]);
+const LOG_MEASURES = new Set([
+  'count',
+  'distinct',
+  'sum',
+  'avg',
+  'min',
+  'max',
+  'p50',
+  'p95',
+  'p99',
+]);
+const MAX_TOP_GROUPS = 50;
+
+/** The backend's ValidateOptions for a logs panel's measure, top groups and bands. */
+export function checkLogOptions(panel: Panel) {
+  const measure = panel.measure ?? 'count';
+  if (!LOG_MEASURES.has(measure)) bad(`invalid aggregation request: unknown measure "${measure}"`);
+  if (measure !== 'count' && !panel.measureField) {
+    bad(`invalid aggregation request: measure "${measure}" needs a measureField`);
+  }
+  const top = panel.topGroups ?? 0;
+  if (top < 0 || top > MAX_TOP_GROUPS) {
+    bad(`invalid aggregation request: topGroups must be between 0 and ${MAX_TOP_GROUPS}`);
+  }
+  if (top > 0 && !panel.groupField)
+    bad('invalid aggregation request: topGroups needs a groupField');
+  if (panel.groupBands) {
+    if (panel.groupBands !== 'log') {
+      bad(`invalid aggregation request: unknown groupBands "${panel.groupBands}"`);
+    }
+    if (!panel.groupField) {
+      bad('invalid aggregation request: groupBands needs a numeric groupField');
+    }
+    if (top > 0) bad("invalid aggregation request: groupBands and topGroups can't be combined");
+  }
+}
+
+/** The v2 kinds' display settings, refused on the types that don't use them. */
+function checkPanelSettings(panel: Panel) {
+  const gauge = panel.type === 'gauge';
+  const thresholds = gauge || panel.type === 'statusStrip';
+  if ((panel.min !== undefined || panel.max !== undefined) && !gauge) {
+    bad(`panel "${panel.title}": min and max are for gauges only`);
+  }
+  if (panel.min !== undefined && panel.max !== undefined && panel.min >= panel.max) {
+    bad(`panel "${panel.title}": min must be less than max`);
+  }
+  if (panel.thresholds && !thresholds) {
+    bad(`panel "${panel.title}": thresholds are for gauges and status strips only`);
+  }
+  if (panel.higherIs && !thresholds && panel.type !== 'statTrend') {
+    bad(`panel "${panel.title}": higherIs is for stat with trend, gauges and status strips only`);
+  }
+  if (panel.higherIs && panel.higherIs !== 'good' && panel.higherIs !== 'bad') {
+    bad(`panel "${panel.title}": invalid higherIs "${panel.higherIs}"`);
+  }
+}
 const SOURCES = new Set(['logs', 'spans', 'metrics']);
 const UNITS = new Set(['bytes', 'percent']);
 export const SPAN_METRICS = new Set([
@@ -76,6 +145,11 @@ function normalizePanels(panels: Panel[] | undefined): Panel[] {
     if (panel.unit && !UNITS.has(panel.unit)) bad(`invalid panel unit "${panel.unit}"`);
     if ((panel.promQuery?.length ?? 0) > MAX_TEXT_BYTES) {
       bad(`a panel query can't be longer than ${MAX_TEXT_BYTES} bytes`);
+    }
+    checkPanelSettings(panel);
+    if (effectivePanelSource(panel) === 'logs') {
+      checkLogOptions(panel);
+      if (panel.groupBands) bad("log bands are for previews only and can't be saved");
     }
     if (effectivePanelSource(panel) === 'spans') {
       if (panel.groupField && !SPAN_GROUPS.has(panel.groupField)) {
@@ -238,6 +312,7 @@ export function runPanel(projectId: string, panel: Panel, range: Range): Aggrega
     case 'metrics':
       return metricPanelBuckets(projectId, panel, range);
     default:
+      checkLogOptions(panel);
       return aggregateLogPanel(projectId, panel, range);
   }
 }
@@ -473,6 +548,34 @@ export function register(r: Router) {
   });
 
   // Folders (the literal "folders" segment beats :dashboardId when matching).
+  // One panel added to the bottom of a tab (the first when tabId is empty): MCP's add_dashboard_panel.
+  r.post(`${base}/:dashboardId/panels`, (req) => {
+    requireProject(req.params.pid);
+    const dashboard = ownedDashboard(req.params.pid, req.params.dashboardId);
+    const body = (req.body ?? {}) as { tabId?: string; panel?: Panel };
+    if (!body.panel || typeof body.panel !== 'object') bad('Invalid request format');
+    const tabs = (dashboard.tabs ?? []).map((t) => ({ ...t, panels: [...t.panels] }));
+    const index = tabs.findIndex((t) => !body.tabId || t.id === body.tabId);
+    if (index < 0) bad('tab not found on this dashboard');
+    const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
+    const gridPos = body.panel!.gridPos ?? { x: 0, y: 0, w: 0, h: 0 };
+    const bottom = tabs[index].panels.reduce((m, p) => Math.max(m, p.gridPos.y + p.gridPos.h), 0);
+    tabs[index].panels.push({
+      ...body.panel!,
+      id: '',
+      gridPos: {
+        x: 0,
+        y: bottom,
+        w: clamp(gridPos.w > 0 ? gridPos.w : 6, 1, 12),
+        h: clamp(gridPos.h > 0 ? gridPos.h : 8, 1, 48),
+      },
+    });
+    const normalized = normalizeTabs(tabs);
+    const saved = dashboards.update(dashboard.id, { tabs: normalized, updatedAt: now() })!;
+    const panels = normalized[index].panels;
+    return { dashboard: saved, tabId: normalized[index].id, panel: panels[panels.length - 1] };
+  });
+
   r.get(`${base}/folders`, (req) => {
     requireProject(req.params.pid);
     return {

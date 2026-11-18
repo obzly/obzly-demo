@@ -48,6 +48,17 @@ function rangeOf(query: URLSearchParams) {
   return { from, to };
 }
 
+/** The query for the equally long window right before the range (compare=previous). */
+function previousWindow(query: URLSearchParams): URLSearchParams {
+  const { from, to } = rangeOf(query);
+  const previous = new URLSearchParams(query);
+  previous.set('from', new Date(from - (to - from)).toISOString());
+  previous.set('to', new Date(from).toISOString());
+  previous.delete('compare');
+  previous.delete('bucketSeconds');
+  return previous;
+}
+
 function bucketSecondsOf(query: URLSearchParams, from: number, to: number) {
   const span = Math.max(1, Math.floor((to - from) / 1000));
   const asked = Number(query.get('bucketSeconds'));
@@ -861,7 +872,14 @@ function requireBudget(projectId: string, id: string) {
 
 export function register(r: Router) {
   // --- Claude Code -----------------------------------------------------------
-  r.get('/ai-usage/overview/:projectId', (req) => overview(req.params.projectId, req.query));
+  r.get('/ai-usage/overview/:projectId', (req) => {
+    const current = overview(req.params.projectId, req.query);
+    if (req.query.get('compare') !== 'previous') return current;
+    return {
+      ...current,
+      previous: overview(req.params.projectId, previousWindow(req.query)).summary,
+    };
+  });
   r.get('/ai-usage/sessions/:projectId', (req) => sessionsPage(req.params.projectId, req.query));
   r.get('/ai-usage/sessions/:projectId/:sessionId/events', (req) => {
     requireProject(req.params.projectId);
@@ -873,7 +891,12 @@ export function register(r: Router) {
   r.get('/ai-usage/events/:projectId', (req) => eventsPage(req.params.projectId, req.query));
 
   // --- LLM apps --------------------------------------------------------------
-  r.get('/ai-usage/llm/overview/:projectId', (req) => llmOverview(req.params.projectId, req.query));
+  r.get('/ai-usage/llm/overview/:projectId', (req) => {
+    const current = llmOverview(req.params.projectId, req.query);
+    if (req.query.get('compare') !== 'previous') return current;
+    const previous = llmOverview(req.params.projectId, previousWindow(req.query)).summary;
+    return { ...current, previous };
+  });
   r.get('/ai-usage/llm/calls/:projectId', (req) => llmCalls(req.params.projectId, req.query));
 
   // --- budgets ---------------------------------------------------------------

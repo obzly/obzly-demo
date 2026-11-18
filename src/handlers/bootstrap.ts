@@ -6,7 +6,7 @@ import type {
   PromotedField,
   RetentionPolicy,
 } from '../../entity/projects';
-import type { UserProfile, UsersSettings } from '../../entity/users';
+import type { UIPreferences, UserProfile, UsersSettings } from '../../entity/users';
 import { DemoError, type Router } from '../router';
 import { users } from '../seed/users';
 import { collection, newId, value } from '../store';
@@ -40,16 +40,55 @@ export const currentUser = (): UserProfile => ({
   mfaEnabled: demoUserMfa(),
   isRootAdmin: true,
   ...profile.get(),
+  ...(uiPreferences.get() ? { uiPreferences: uiPreferences.get()! } : {}),
 });
 
 const profile = value<{ name?: string; email?: string }>('profile', () => ({}));
 
-export const usersSettings = value<UsersSettings>('usersSettings', () => ({
+/** The signed-in user's saved UI choices (the theme); absent until they pick one. */
+const uiPreferences = value<UIPreferences | null>('uiPreferences', () => null);
+
+const THEME_MODES = ['light', 'dark', 'system'];
+const LIGHT_THEMES = ['emerald-light', 'soft-light', 'semi-dark'];
+const DARK_THEMES = ['emerald-dark', 'midnight', 'black'];
+
+function validPreferences(body: unknown): UIPreferences {
+  const theme = (body as UIPreferences | undefined)?.theme;
+  if (!theme) return {};
+  if (!THEME_MODES.includes(theme.mode))
+    throw new DemoError(400, 'theme.mode must be light, dark or system');
+  if (!LIGHT_THEMES.includes(theme.light))
+    throw new DemoError(400, `unknown light theme "${theme.light}"`);
+  if (!DARK_THEMES.includes(theme.dark))
+    throw new DemoError(400, `unknown dark theme "${theme.dark}"`);
+  return {
+    theme: {
+      mode: theme.mode,
+      light: theme.light,
+      dark: theme.dark,
+      colorBlindCharts: theme.colorBlindCharts === true,
+    },
+  };
+}
+
+const USERS_SETTINGS_DEFAULTS: UsersSettings = {
   isAllowExternalRegistrations: false,
   isAllowMemberInvitations: true,
   isMemberAllowedToCreateProjects: false,
   isMfaRequiredForEveryone: false,
-}));
+  defaultThemeMode: 'system',
+  defaultLightTheme: 'emerald-light',
+  defaultDarkTheme: 'emerald-dark',
+  isUserThemeChoiceAllowed: true,
+};
+
+const storedUsersSettings = value<UsersSettings>('usersSettings', () => USERS_SETTINGS_DEFAULTS);
+
+/** Settings saved before the theme fields existed get their defaults. */
+export const usersSettings = {
+  get: (): UsersSettings => ({ ...USERS_SETTINGS_DEFAULTS, ...storedUsersSettings.get() }),
+  set: (next: UsersSettings): UsersSettings => storedUsersSettings.set(next),
+};
 
 const projectDefaults = (id: string, name: string, createdDaysAgo: number): Project => ({
   id,
@@ -165,10 +204,18 @@ export function register(r: Router) {
     profile.set({ ...profile.get(), ...body });
     return { message: 'Profile updated' };
   });
+  r.put('/users/me/preferences', (req) => uiPreferences.set(validPreferences(req.body)));
   r.get('/users/settings', () => usersSettings.get());
-  r.put('/users/settings', (req) =>
-    usersSettings.set({ ...usersSettings.get(), ...(req.body as UsersSettings) }),
-  );
+  r.put('/users/settings', (req) => {
+    const body = (req.body ?? {}) as UsersSettings;
+    if (body.defaultThemeMode !== undefined && !THEME_MODES.includes(body.defaultThemeMode))
+      throw new DemoError(400, 'defaultThemeMode must be light, dark or system');
+    if (body.defaultLightTheme !== undefined && !LIGHT_THEMES.includes(body.defaultLightTheme))
+      throw new DemoError(400, `unknown light theme "${body.defaultLightTheme}"`);
+    if (body.defaultDarkTheme !== undefined && !DARK_THEMES.includes(body.defaultDarkTheme))
+      throw new DemoError(400, `unknown dark theme "${body.defaultDarkTheme}"`);
+    return usersSettings.set({ ...usersSettings.get(), ...body });
+  });
   r.get('/users/mfa/status', () => ({
     enabled: demoUserMfa(),
     required: false,

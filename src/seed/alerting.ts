@@ -30,7 +30,16 @@ export const CHANNEL_SRE_EMAIL = uuidFrom('demo-channel:email-sre');
 export const CHANNEL_WEBHOOK = uuidFrom('demo-channel:webhook-incidents');
 
 export function seedChannels(): StoredChannel[] {
-  const base = { source: 'local' as const, allProjects: true, projectIds: [] as string[] };
+  const base = {
+    source: 'local' as const,
+    allProjects: true,
+    projectIds: [] as string[],
+    useEmoji: true,
+    templateOverride: false,
+    templateSubject: '',
+    templateBody: '',
+    templateError: '',
+  };
   return [
     {
       ...base,
@@ -66,6 +75,7 @@ export function seedChannels(): StoredChannel[] {
       kind: 'email',
       target: 'sre@harborline.example.com, oncall@harborline.example.com',
       config: { to: ['sre@harborline.example.com', 'oncall@harborline.example.com'] },
+      useEmoji: false,
       updatedAt: daysAgo(66),
     },
     {
@@ -128,10 +138,41 @@ export const RULE_POSTGRES_CONNECTIONS = uuidFrom('demo-rule:postgres-connection
 
 type SeedRule = Omit<AlertRule, 'lastEvalAt'>;
 
-const rule = (key: string, fields: Omit<SeedRule, 'id' | 'projectId' | 'lastError'>): SeedRule => ({
+/** Severities and runbooks; any other rule takes its severity from the label (else medium). */
+const SEVERITY: Record<string, AlertRule['severity']> = {
+  'checkout-5xx': 'critical',
+  'payments-p95': 'high',
+  'postgres-connections': 'high',
+  'node-cpu': 'medium',
+  'storefront-traffic': 'critical',
+  'search-p95': 'medium',
+  'auth-failures': 'medium',
+  'new-error-patterns': 'low',
+};
+const RUNBOOK: Record<string, string> = {
+  'checkout-5xx':
+    'Open the Checkout & payments dashboard. If payments p95 rose with it, follow the payments ' +
+    'runbook (pool exhaustion); otherwise roll back the last checkout deploy.',
+  'payments-p95':
+    'Usually the Postgres connection pool: check pool_waiting in the payments logs and roll back ' +
+    'the payments release that shipped just before the spike.',
+  'postgres-connections':
+    'Find the client holding connections (Postgres dashboard, connections by application) before ' +
+    'raising max_connections.',
+  'storefront-traffic':
+    'Check the ingress controller and the Storefront home synthetic monitor first; a drop with ' +
+    'no errors is often DNS or the CDN.',
+};
+
+const rule = (
+  key: string,
+  fields: Omit<SeedRule, 'id' | 'projectId' | 'lastError' | 'severity' | 'description'>,
+): SeedRule => ({
   id: uuidFrom(`demo-rule:${key}`),
   projectId: PROJECT_ID,
   lastError: '',
+  severity: SEVERITY[key] ?? 'medium',
+  description: RUNBOOK[key] ?? '',
   ...fields,
 });
 
@@ -339,6 +380,15 @@ export function seedSilences(): Silence[] {
       startsAt: new Date(tomorrowOne).toISOString(),
       endsAt: new Date(tomorrowOne + 2 * HOUR).toISOString(),
       comment: 'Postgres 16.4 to 16.5 minor upgrade window (CHG-2304).',
+    },
+    {
+      id: uuidFrom('demo-silence:node-cpu-mcp'),
+      projectId: PROJECT_ID,
+      matchers: [{ name: 'alertname', value: 'Node CPU high' }],
+      startsAt: new Date(Math.floor((now - 40 * 60_000) / 60_000) * 60_000).toISOString(),
+      endsAt: hour(now + 3 * HOUR),
+      comment: 'Batch reindex on the nodes until the next hour; asked for in chat by Priya.',
+      mcpClient: 'Claude Desktop (MCP)',
     },
   ];
 }

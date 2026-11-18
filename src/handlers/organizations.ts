@@ -11,13 +11,14 @@ import type {
   Team,
   TeamGrant,
 } from '../../entity/organizations';
+import type { UserDetail } from '../../entity/users';
 import { DemoError, type Router } from '../router';
 import { recordAudit } from '../seed/audit';
 import { DAY, HOUR, ORG_ID, PEOPLE, TEAMS, type When, ago, isoOf } from '../seed/people';
-import { DEMO_SITE_ID } from '../seed/site';
+import { DEMO_SITE_DISPLAY_NAME, DEMO_SITE_ID } from '../seed/site';
 import { collection, newId } from '../store';
 import { DEMO_USER_ID } from '../world';
-import { userByEmail, userIdentity, users } from './admin';
+import { projectRolesOf, toProfile, userByEmail, userIdentity, userStatus, users } from './admin';
 import { projects } from './bootstrap';
 
 interface OrgRecord {
@@ -46,6 +47,8 @@ interface OrgMemberRecord {
   role: OrgRole;
   externalId?: string;
   suspended: boolean;
+  /** When they joined; older saved demos lack it (the account's creation then). */
+  createdAt?: When;
 }
 
 const orgMembers = collection<OrgMemberRecord>('orgMembers', () =>
@@ -56,6 +59,7 @@ const orgMembers = collection<OrgMemberRecord>('orgMembers', () =>
     role: p.orgRole,
     externalId: p.scimExternalId,
     suspended: !p.isActive,
+    createdAt: p.createdAt,
   })),
 );
 
@@ -141,6 +145,7 @@ const toOrg = (o: OrgRecord): Organization => ({
 function toMember(m: OrgMemberRecord): OrgMember | undefined {
   const identity = userIdentity(m.userId);
   if (!identity) return undefined;
+  const joined = m.createdAt ?? users.get(m.userId)?.createdAt ?? ago(30 * DAY);
   return {
     orgId: m.orgId,
     userId: m.userId,
@@ -149,8 +154,49 @@ function toMember(m: OrgMemberRecord): OrgMember | undefined {
     suspended: m.suspended,
     email: identity.email,
     name: identity.name,
+    createdAt: isoOf(joined),
+    teams: teams
+      .find((t) => t.orgId === m.orgId && t.memberIds.includes(m.userId))
+      .map((t) => t.name)
+      .sort(),
   };
 }
+
+/** The organization's latest SCIM provisioning changes, as the audit log records them. */
+const SCIM_EVENTS: { id: string; message: string; at: number }[] = [
+  {
+    id: 'scim-ev-1',
+    message: 'SCIM (IdP provisioning): user hana.kobayashi@harborline.example.com created',
+    at: 5 * DAY + 3 * HOUR,
+  },
+  {
+    id: 'scim-ev-2',
+    message:
+      'SCIM (IdP provisioning): user hana.kobayashi@harborline.example.com added to team Shop engineering',
+    at: 5 * DAY + 3 * HOUR - 40_000,
+  },
+  {
+    id: 'scim-ev-3',
+    message: 'SCIM (IdP provisioning): user ben.carter@harborline.example.com deactivated',
+    at: 3 * DAY + HOUR + 120_000,
+  },
+  {
+    id: 'scim-ev-4',
+    message: 'SCIM (IdP provisioning): group Customer support synced (1 member)',
+    at: 2 * DAY + 5 * HOUR,
+  },
+  {
+    id: 'scim-ev-5',
+    message:
+      'SCIM (IdP provisioning): user tomas.herrera@harborline.example.com display name updated',
+    at: 9 * HOUR,
+  },
+  {
+    id: 'scim-ev-6',
+    message: 'SCIM (IdP provisioning): group Platform synced (3 members)',
+    at: 2 * HOUR,
+  },
+];
 
 function toTeam(t: TeamRecord): Team {
   return {
@@ -184,7 +230,70 @@ const toPlan = (p: PlanRecord): OrgPlan => {
   return { ...rest, updatedAt: isoOf(p.updatedAt) };
 };
 
+const SCIM_TOKEN_NAME = 'IdP provisioning';
+
+/** The Users page's side panel: sign-in methods, organizations and access. */
+function userDetail(userId: string): UserDetail {
+  const user = users.get(userId);
+  if (!user) throw new DemoError(404, 'User not found');
+  const profile = toProfile(user);
+  const memberOf = orgMembers.find((m) => m.userId === userId);
+  const scim = memberOf.some((m) => !!m.externalId);
+  const userTeams = teams.find((t) => t.memberIds.includes(userId));
+  const siteAccess: UserDetail['siteAccess'] = [
+    ...userTeams.flatMap((t) =>
+      t.grants.map((g) => ({
+        siteId: g.siteId ?? DEMO_SITE_ID,
+        siteName: DEMO_SITE_DISPLAY_NAME,
+        projectId: g.projectId,
+        role: g.role,
+        via: 'team' as const,
+        team: t.name,
+        org: orgs.get(t.orgId)?.name,
+      })),
+    ),
+    ...projectRolesOf(userId).map((m) => ({
+      siteId: DEMO_SITE_ID,
+      siteName: DEMO_SITE_DISPLAY_NAME,
+      projectId: m.projectId,
+      role: m.role,
+      via: (scim ? 'sso' : 'direct') as 'sso' | 'direct',
+    })),
+  ];
+  return {
+    id: user.id,
+    email: profile.email,
+    name: profile.name,
+    role: profile.role,
+    status: userStatus(user),
+    isActive: user.isActive,
+    isRootAdmin: !!user.isRootAdmin,
+    createdAt: String(profile.createdAt),
+    lastLoginAt: profile.lastLoginAt ?? null,
+    lastActiveAt: profile.lastActiveAt ?? null,
+    mfaEnabled: user.mfaEnabled,
+    mfaRequired: user.role === 'ADMIN',
+    signInMethods: [
+      ...(scim ? [] : [{ kind: 'password' as const }]),
+      { kind: 'sso' as const, name: 'Harborline Identity' },
+    ],
+    provisionedBy: scim ? { id: 'scim-idp-provisioning', name: SCIM_TOKEN_NAME } : null,
+    organizations: memberOf.map((m) => ({
+      orgId: m.orgId,
+      name: orgs.get(m.orgId)?.name ?? m.orgId,
+      role: m.role,
+      suspended: m.suspended,
+      teams: userTeams.filter((t) => t.orgId === m.orgId).map((t) => t.name),
+    })),
+    siteAccess,
+    projectRoles: [],
+    projectRolesOnSites: true,
+  };
+}
+
 export function register(r: Router) {
+  r.get('/users/:userId/detail', (req) => userDetail(req.params.userId));
+
   // --- organizations -----------------------------------------------------------
   r.get('/orgs', () => orgs.all().map(toOrg));
   r.post('/orgs', (req) => {
@@ -203,6 +312,7 @@ export function register(r: Router) {
       userId: DEMO_USER_ID,
       role: 'ORG_OWNER',
       suspended: false,
+      createdAt: Date.now(),
     });
     recordAudit(`Organization created: ${name}`);
     return toOrg(org);
@@ -262,6 +372,7 @@ export function register(r: Router) {
         userId: user.id,
         role: body.role as OrgRole,
         suspended: false,
+        createdAt: Date.now(),
       });
     recordAudit(
       `Organization member ${existing ? 'updated' : 'added'}: ${user.email} as ${body.role}`,
@@ -436,6 +547,15 @@ export function register(r: Router) {
   });
 
   // --- SCIM tokens -------------------------------------------------------------------
+  r.get('/orgs/:orgId/scim-events', (req) => {
+    const org = requireOrg(req.params.orgId);
+    if (org.id !== ORG_ID) return [];
+    const limit = Math.min(Math.max(Number(req.query.get('limit')) || 20, 1), 100);
+    return SCIM_EVENTS.slice()
+      .sort((a, b) => a.at - b.at)
+      .slice(0, limit)
+      .map((e) => ({ id: e.id, message: e.message, createdAt: isoOf(ago(e.at)) }));
+  });
   r.get('/orgs/:orgId/scim-tokens', (req) => {
     requireOrg(req.params.orgId);
     return scimTokens

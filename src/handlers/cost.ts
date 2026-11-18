@@ -221,6 +221,7 @@ function summary(projects: string[], now = Date.now()): CostSummary {
   const sameDays = Math.min(lastStart + (d.getUTCDate() - 1) * DAY, monthStart - DAY);
   const dailyFrom = todayStart - 89 * DAY;
   const byCurrency = new Map<string, CostSummary['currencies'][number]>();
+  const lastMonthEstimated = new Set<string>();
   const daily = new Map<string, Map<string, { amount: number; estimated: boolean }>>();
   for (const row of costRows(Math.min(lastStart, dailyFrom), todayStart, (l) =>
     projects.includes(l.projectId),
@@ -241,6 +242,7 @@ function summary(projects: string[], now = Date.now()): CostSummary {
     const t = Date.parse(`${row.day}T00:00:00Z`);
     if (t >= monthStart) s.monthToDate += row.effective;
     else if (t >= lastStart) {
+      if (row.estimated) lastMonthEstimated.add(currency);
       s.lastMonth += row.effective;
       if (t <= sameDays) s.lastMonthSameDays += row.effective;
     }
@@ -288,6 +290,10 @@ function summary(projects: string[], now = Date.now()): CostSummary {
       deliveredAt: s.deliveredAt,
       forecastAt: s.deliveredAt,
     }));
+  // Final once no day of it is estimated and every source has finalised its last day.
+  const lastDay = dayKey(monthStart - DAY);
+  const finalised = sources.every((s) => !s.finalThrough || s.finalThrough >= lastDay);
+  for (const s of currencies) s.lastMonthFinal = finalised && !lastMonthEstimated.has(s.currency);
   return {
     today: dayKey(todayStart),
     currencies,

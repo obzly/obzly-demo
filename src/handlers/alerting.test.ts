@@ -231,14 +231,21 @@ describe('alerts', () => {
 describe('silences', () => {
   it('lists active and upcoming silences, creates and deletes them', async () => {
     const seeded = (await call('GET', `${p}/silences`)) as Silence[];
-    expect(seeded).toHaveLength(2);
+    expect(seeded).toHaveLength(3);
+    expect(seeded.filter((s) => s.mcpClient)).toHaveLength(1);
     const created = (await call('POST', `${p}/silences`, {
       matchers: [{ name: 'team', value: 'checkout' }],
       endsAt: new Date(Date.now() + 3_600_000).toISOString(),
       comment: 'deploy',
     })) as Silence;
-    expect(((await call('GET', `${p}/silences`)) as Silence[]).length).toBe(3);
+    expect(((await call('GET', `${p}/silences`)) as Silence[]).length).toBe(4);
     await call('DELETE', `${p}/silences/${created.id}`);
+    // Expiring ends it now and keeps it on record; the list shows current ones only.
+    const mcp = seeded.find((s) => s.mcpClient)!;
+    const expired = (await call('POST', `${p}/silences/${mcp.id}/expire`)) as Silence;
+    expect(Date.parse(expired.endsAt)).toBeLessThanOrEqual(Date.now());
+    expect(((await call('GET', `${p}/silences`)) as Silence[]).length).toBe(2);
+    expect(await status(call('POST', `${p}/silences/${mcp.id}/expire`))).toBe(409);
     expect(
       await status(
         call('POST', `${p}/silences`, {

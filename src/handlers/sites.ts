@@ -107,6 +107,22 @@ function usage(now = Date.now()): SystemUsage {
       bytes: Math.round(kept[signal] / SIGNALS[signal].ratio),
       oldest,
     })),
+    projects: projects.all().length,
+  };
+}
+
+/**
+ * The newest Obzly release: the demo always runs the latest one, so it is
+ * this build's version (published a couple of days before the demo picked it up).
+ */
+function latestRelease(refresh: boolean, now = Date.now()) {
+  const version = DEMO_VERSION.replace(/^v/, '').replace(/-.*$/, '');
+  return {
+    status: 'known' as const,
+    version,
+    publishedAt: new Date(Math.floor((now - 2 * DAY) / HOUR) * HOUR).toISOString(),
+    url: `https://github.com/obzly/obzly/releases/tag/v${version}`,
+    checkedAt: new Date(refresh ? now : Math.floor(now / (6 * HOUR)) * 6 * HOUR).toISOString(),
   };
 }
 
@@ -396,6 +412,8 @@ export function register(r: Router) {
   r.get('/system/upgrade-status', (req) =>
     isSiteCall(req) ? siteUpgradeStatus() : centralUpgradeStatus(),
   );
+  // Asked of this origin's server only, never through a Site.
+  r.get('/system/latest-release', (req) => latestRelease(req.query.get('refresh') === 'true'));
   r.get('/system/usage', (req) => {
     // A control plane holds no signal data; the UI asks each Site.
     if (!isSiteCall(req)) throw new DemoError(404, 'Usage is reported by each Site');

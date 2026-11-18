@@ -71,6 +71,49 @@ export function toProfile(u: UserRecord, now = Date.now()): UserProfile {
   };
 }
 
+export type UserStatus = 'ACTIVE' | 'INVITED' | 'INACTIVE';
+
+/** The account's status: deactivated, invited (never signed in) or active. */
+export const userStatus = (u: UserRecord): UserStatus =>
+  !u.isActive ? 'INACTIVE' : u.lastLoginAt === null ? 'INVITED' : 'ACTIVE';
+
+/** No sign-in or request for 30 days (or not ACTIVE): the activity=inactive filter. */
+export function isInactiveUser(u: UserRecord, now = Date.now()): boolean {
+  if (userStatus(u) !== 'ACTIVE') return true;
+  const seen = Math.max(
+    u.lastLoginAt === null ? -Infinity : resolveWhen(u.lastLoginAt, now),
+    u.lastActiveAt === null ? -Infinity : resolveWhen(u.lastActiveAt, now),
+  );
+  return seen < now - 30 * DAY;
+}
+
+function usersSummary(now = Date.now()) {
+  const all = users.all();
+  const active = all.filter((u) => userStatus(u) === 'ACTIVE');
+  const lastSeen = (u: UserRecord) =>
+    Math.max(
+      u.lastLoginAt === null ? -Infinity : resolveWhen(u.lastLoginAt, now),
+      u.lastActiveAt === null ? -Infinity : resolveWhen(u.lastActiveAt, now),
+    );
+  return {
+    total: all.length,
+    activeAccounts: active.length,
+    invited: all.filter((u) => userStatus(u) === 'INVITED').length,
+    deactivated: all.filter((u) => userStatus(u) === 'INACTIVE').length,
+    activeLast7Days: active.filter((u) => lastSeen(u) >= now - 7 * DAY).length,
+    inactive: all.filter((u) => isInactiveUser(u, now)).length,
+    mfaEnabled: active.filter((u) => u.mfaEnabled).length,
+    admins: all.filter((u) => u.role === 'ADMIN').length,
+    adminsWithoutMfa: all.filter((u) => u.role === 'ADMIN' && !u.mfaEnabled).length,
+  };
+}
+
+/** A user's direct project roles, for the user detail panel. */
+export const projectRolesOf = (userId: string) =>
+  memberships
+    .find((m) => m.userId === userId)
+    .map((m) => ({ projectId: m.projectId, role: m.role }));
+
 function requireUser(id: string) {
   const user = users.get(id);
   if (!user) throw new DemoError(404, 'User not found');
@@ -259,12 +302,13 @@ const tokenSeed = (
   createdAgo: number,
   days: number,
   usedAgo: number | null,
+  write = false,
 ): AccessTokenRecord => ({
   id: `pat-${hashString(key).toString(16)}`,
   userId: DEMO_USER_ID,
   name,
   tokenPrefix: `obz_demo_pat_${hex(hashString(key), 6)}...`,
-  scopes: ['mcp:read'],
+  scopes: write ? ['mcp:read', 'mcp:write'] : ['mcp:read'],
   createdAt: ago(createdAgo),
   validFor: days * DAY,
   lastUsedAt: usedAgo === null ? null : ago(usedAgo),
@@ -272,7 +316,7 @@ const tokenSeed = (
 
 const accessTokens = collection<AccessTokenRecord>('accessTokens', () => [
   tokenSeed('claude-code', 'Claude Code MCP (laptop)', 21 * DAY, 90, 35 * MINUTE),
-  tokenSeed('ci-runbooks', 'Runbook automation', 48 * DAY, 365, 3 * HOUR),
+  tokenSeed('ci-runbooks', 'Runbook automation', 48 * DAY, 365, 3 * HOUR, true),
 ]);
 
 const toAccessToken = (t: AccessTokenRecord, now = Date.now()): AccessToken => ({
@@ -292,6 +336,7 @@ interface OAuthAppRecord {
   lastUsedAt: When;
   /** ms from now (positive: future). */
   expiresIn: number;
+  scopes?: string[];
 }
 
 const oauthApps = collection<OAuthAppRecord>('oauthApps', () => [
@@ -301,6 +346,7 @@ const oauthApps = collection<OAuthAppRecord>('oauthApps', () => [
     clientId: 'demo-client-claude-desktop',
     lastUsedAt: ago(25 * MINUTE),
     expiresIn: 52 * DAY,
+    scopes: ['mcp:read', 'mcp:write'],
   },
   {
     id: 'oauth-ops-bot',
@@ -493,8 +539,26 @@ function registerUsers(r: Router) {
       : NaN;
     const limit = Math.min(Math.max(Number(req.query.get('limit')) || 20, 1), 200);
     const offset = Math.max(Number(req.query.get('offset')) || 0, 0);
+    const role = req.query.get('role');
+    const mfa = req.query.get('mfa');
+    const status = req.query.get('status');
+    const activity = req.query.get('activity');
+    if (role && role !== 'ADMIN' && role !== 'MEMBER')
+      throw new DemoError(400, 'role must be ADMIN or MEMBER');
+    if (mfa && mfa !== 'on' && mfa !== 'off') throw new DemoError(400, 'mfa must be on or off');
+    if (status && !['ACTIVE', 'INVITED', 'INACTIVE'].includes(status))
+      throw new DemoError(400, 'status must be ACTIVE, INVITED or INACTIVE');
+    if (activity && activity !== 'active' && activity !== 'inactive')
+      throw new DemoError(400, 'activity must be active or inactive');
     const list = users
       .all()
+      .filter(
+        (u) =>
+          (!role || u.role === role) &&
+          (!mfa || u.mfaEnabled === (mfa === 'on')) &&
+          (!status || userStatus(u) === status) &&
+          (!activity || isInactiveUser(u, now) === (activity === 'inactive')),
+      )
       .map((u) => toProfile(u, now))
       .filter(
         (u) =>
@@ -506,6 +570,7 @@ function registerUsers(r: Router) {
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
     return { users: list.slice(offset, offset + limit), total: list.length };
   });
+  r.get('/users/summary', () => usersSummary());
   r.get('/users/:userId', (req) => toProfile(requireUser(req.params.userId)));
   r.post('/users/invite', (req) => {
     const body = (req.body ?? {}) as {
@@ -635,7 +700,7 @@ function registerIdentity(r: Router) {
     };
   });
   r.post('/access-tokens', (req) => {
-    const body = (req.body ?? {}) as { name?: string; expiresInDays?: number };
+    const body = (req.body ?? {}) as { name?: string; expiresInDays?: number; write?: boolean };
     const name = (body.name ?? '').trim();
     if (!name) throw new DemoError(400, 'name is required');
     if (![30, 90, 365].includes(Number(body.expiresInDays)))
@@ -649,7 +714,8 @@ function registerIdentity(r: Router) {
       userId: DEMO_USER_ID,
       name,
       tokenPrefix: prefixOf(token, 'pat'),
-      scopes: ['mcp:read'],
+      // mcp:write needs a session that passed MFA: the demo's always has.
+      scopes: body.write ? ['mcp:read', 'mcp:write'] : ['mcp:read'],
       createdAt: now,
       validFor: Number(body.expiresInDays) * DAY,
       lastUsedAt: null,
@@ -674,6 +740,7 @@ function registerIdentity(r: Router) {
       clientId: a.clientId,
       lastUsedAt: isoOf(a.lastUsedAt, now),
       expiresAt: new Date(now + a.expiresIn).toISOString(),
+      scopes: a.scopes ?? ['mcp:read'],
     }));
     return { apps };
   });

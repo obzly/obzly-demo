@@ -49,14 +49,54 @@ interface Call {
   path: string;
 }
 
+const toPath = (expanded: string) =>
+  expanded
+    .replace(/\$\{[^}]*\}/g, (_interp, offset, whole) =>
+      // An interpolated query string (`${qs}`) at the end isn't a segment.
+      offset > 0 && whole[offset - 1] !== '/' ? '' : 'x',
+    )
+    .replace(/\?.*$/, '')
+    .replace(/\/$/, '');
+
+/**
+ * Calls through a local helper that takes the path as its first parameter
+ * (`const post = (path: string, ...) => ... \`${base}/x/${path}\``): each
+ * caller's literal (quoted or a template) completes the helper's URL.
+ */
+function pathHelperCalls(file: string, source: string, out: Call[]): Set<string> {
+  const helperLiterals = new Set<string>();
+  const helper =
+    /const\s+(\w+)\s*=\s*(?:async\s*)?(?:<[^>]*>)?\(\s*(\w+)\s*:\s*string[^)]*\)[^{]*\{([\s\S]*?)\n\};/g;
+  let match: RegExpExecArray | null;
+  while ((match = helper.exec(source))) {
+    const [, name, param, body] = match;
+    const literal = new RegExp(`\`([^\`]*)\\$\\{${param}\\}\``).exec(body);
+    if (!literal) continue;
+    helperLiterals.add(literal[1] + '${' + param + '}');
+    const prefix = expandHelpers(literal[1], source);
+    if (prefix === undefined) continue;
+    const explicit = /method:\s*'(\w+)'/.exec(body)?.[1];
+    const fetchKind = /fetch(Get|Post|Put|Delete|Patch)/.exec(body)?.[1];
+    const method = (explicit ?? fetchKind ?? 'GET').toUpperCase();
+    const caller = new RegExp(`\\b${name}(?:<[^>]*>)?\\(\\s*(?:'([^']*)'|\`([^\`]*)\`)`, 'g');
+    let call: RegExpExecArray | null;
+    while ((call = caller.exec(source))) {
+      const path = toPath(prefix + (call[1] ?? call[2]));
+      if (path) out.push({ file: file.replace(/^\.\.\//, ''), method, path });
+    }
+  }
+  return helperLiterals;
+}
+
 function calls(): Call[] {
   const out: Call[] = [];
   for (const [file, source] of Object.entries(SOURCES)) {
+    const helperLiterals = pathHelperCalls(file, source, out);
     const literal = /`([^`]*)`/g;
     let match: RegExpExecArray | null;
     while ((match = literal.exec(source))) {
       const text = match[1];
-      if (!text.startsWith('${')) continue;
+      if (!text.startsWith('${') || helperLiterals.has(text)) continue;
       const expanded = expandHelpers(text, source);
       if (expanded === undefined || !expanded.startsWith('/')) continue;
       // `${base()}${path}`: a helper taking its path as a parameter; the
@@ -74,13 +114,7 @@ function calls(): Call[] {
       const explicit = /method:\s*'(\w+)'/.exec(tail)?.[1];
       const helper = [...lead.matchAll(/fetch(Get|Post|Put|Delete|Patch)|streamNdjson/g)].pop();
       const method = (explicit ?? (helper ? (helper[1] ?? 'POST') : 'GET')).toUpperCase();
-      const path = expanded
-        .replace(/\$\{[^}]*\}/g, (_interp, offset, whole) =>
-          // An interpolated query string (`${qs}`) at the end isn't a segment.
-          offset > 0 && whole[offset - 1] !== '/' ? '' : 'x',
-        )
-        .replace(/\?.*$/, '')
-        .replace(/\/$/, '');
+      const path = toPath(expanded);
       if (path) out.push({ file: file.replace(/^\.\.\//, ''), method, path });
     }
   }
