@@ -1,12 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CloudConnection, CloudTest } from '../../entity/cloud';
-import type { AssetChange, AssetDetail, AssetList, InventorySummary } from '../../entity/inventory';
+import type {
+  Asset,
+  AssetChange,
+  AssetDetail,
+  AssetList,
+  AssetSort,
+  InventorySummary,
+  SiteAsset,
+} from '../../entity/inventory';
+import { compareAssets } from '../../features/infrastructure/lib/paging';
 import { cloudSeries } from '../gen/inventory';
 import { Router } from '../router';
-import { AWS_ACCOUNT, AZURE_SUBSCRIPTION } from '../seed/inventory';
+import { AWS_ACCOUNT, AZURE_REGION, AZURE_SUBSCRIPTION } from '../seed/inventory';
 import { resetDemo } from '../store';
-import { CLUSTER, NODES, PROJECT_ID, STAGING_PROJECT_ID, WORKLOADS } from '../world';
+import {
+  CLUSTER,
+  NODES,
+  PROJECT_ID,
+  REGION,
+  STAGING_PROJECT_ID,
+  STAGING_PROJECT_NAME,
+  WORKLOADS,
+} from '../world';
 import { register } from './inventory';
 
 const router = new Router();
@@ -119,6 +136,204 @@ describe('inventory', () => {
     expect(targets.some((s) => s.labels.health === 'unhealthy')).toBe(true);
     const azure = cloudSeries(STAGING_PROJECT_ID, 'cloud_resource_info', [], now - 3_600_000, now);
     expect(azure.every((s) => s.labels.cloud_account_id === AZURE_SUBSCRIPTION)).toBe(true);
+  });
+});
+
+describe('asset list (paging, sorting, tree)', () => {
+  const SORTS: AssetSort[] = [
+    'health',
+    'kind',
+    'name',
+    'cpu',
+    'memory',
+    'restarts',
+    'age',
+    'lastSeen',
+    'attention',
+  ];
+  const site = (a: Asset): SiteAsset => ({ ...a, siteId: '', siteName: '' });
+  const ids = (assets: Asset[]) => assets.map((a) => a.id);
+
+  it('pages the matches from offset; total counts them all', async () => {
+    const all = await call<AssetList>('GET', '/inventory/assets?limit=5000');
+    expect(all.assets.length).toBe(all.total);
+    const first = await call<AssetList>('GET', '/inventory/assets?limit=25');
+    const second = await call<AssetList>('GET', '/inventory/assets?offset=25&limit=25');
+    expect(first.total).toBe(all.total);
+    expect(second.total).toBe(all.total);
+    expect(ids([...first.assets, ...second.assets])).toEqual(ids(all.assets.slice(0, 50)));
+    const past = await call<AssetList>('GET', `/inventory/assets?offset=${all.total}`);
+    expect(past).toEqual({ assets: [], total: all.total });
+    // Bad limits fall back to 2000, a negative offset to 0.
+    const fallback = await call<AssetList>('GET', '/inventory/assets?limit=-3&offset=-9');
+    expect(fallback.assets.length).toBe(Math.min(all.total, 2000));
+    expect(fallback.assets[0].id).toBe(all.assets[0].id);
+  });
+
+  it('sorts every column both ways in the order the UI merges Sites by', async () => {
+    for (const sort of SORTS) {
+      for (const order of ['asc', 'desc'] as const) {
+        const { assets } = await call<AssetList>(
+          'GET',
+          `/inventory/assets?limit=5000&sort=${sort}&order=${order}`,
+        );
+        const expected = [...assets]
+          .map(site)
+          .sort(compareAssets(sort, order === 'asc' ? 'ascend' : 'descend'));
+        expect(ids(assets), `${sort} ${order}`).toEqual(ids(expected));
+      }
+    }
+    const byCpu = await call<AssetList>(
+      'GET',
+      '/inventory/assets?kind=pod,node&sort=cpu&order=desc',
+    );
+    const cpu = byCpu.assets.map((a) => a.metrics.cpuPercent ?? -1);
+    expect(cpu).toEqual([...cpu].sort((a, b) => b - a));
+    const newest = await call<AssetList>('GET', '/inventory/assets?sort=age&limit=1');
+    const oldest = await call<AssetList>('GET', '/inventory/assets?sort=age&order=desc&limit=1');
+    expect(newest.assets[0].firstSeen >= oldest.assets[0].firstSeen).toBe(true);
+    // The default is worst health first, like sort=health.
+    const plain = await call<AssetList>('GET', '/inventory/assets?limit=5000');
+    const health = await call<AssetList>('GET', '/inventory/assets?limit=5000&sort=health');
+    expect(ids(plain.assets)).toEqual(ids(health.assets));
+  });
+
+  it('rejects an unknown sort or order', async () => {
+    await expect(call('GET', '/inventory/assets?sort=size')).rejects.toMatchObject({
+      status: 400,
+      message: 'invalid request: unknown sort "size"',
+    });
+    await expect(call('GET', '/inventory/assets?order=up')).rejects.toMatchObject({
+      status: 400,
+      message: 'order must be asc or desc',
+    });
+  });
+
+  it('searches names, nodes, attribute values and project names, not attribute keys', async () => {
+    const all = (await call<AssetList>('GET', '/inventory/assets?limit=5000')).assets;
+    const staging = all.filter((a) => a.projectId === STAGING_PROJECT_ID);
+    const byProject = await call<AssetList>(
+      'GET',
+      `/inventory/assets?limit=5000&q=${encodeURIComponent(STAGING_PROJECT_NAME.toUpperCase())}`,
+    );
+    expect(staging.length).toBeGreaterThan(0);
+    expect(ids(byProject.assets)).toEqual(expect.arrayContaining(ids(staging)));
+    const byValue = await call<AssetList>('GET', '/inventory/assets?limit=5000&q=aws_ec2_instance');
+    expect(byValue.total).toBeGreaterThan(0);
+    expect(
+      byValue.assets.every((a) => a.attributes.cloud_resource_type === 'aws_ec2_instance'),
+    ).toBe(true);
+    const byKey = await call<AssetList>('GET', '/inventory/assets?q=cloud_resource_type');
+    expect(byKey.total).toBe(0);
+    const byNode = await call<AssetList>('GET', `/inventory/assets?kind=pod&q=${NODES[0]}`);
+    expect(byNode.total).toBeGreaterThan(0);
+    expect(byNode.assets.every((a) => a.node === NODES[0])).toBe(true);
+  });
+
+  it('reads the roots with child counts, then a branch by parent', async () => {
+    const all = (await call<AssetList>('GET', '/inventory/assets?limit=5000')).assets;
+    const present = new Set(all.map((a) => `${a.projectId}|${a.key}`));
+    const roots = await call<AssetList>('GET', '/inventory/assets?roots=true&childCounts=true');
+    expect(roots.total).toBeGreaterThan(0);
+    expect(roots.total).toBeLessThan(all.length);
+    for (const a of roots.assets) {
+      expect(!a.parentKey || !present.has(`${a.projectId}|${a.parentKey}`)).toBe(true);
+      const children = all.filter((c) => c.projectId === a.projectId && c.parentKey === a.key);
+      expect(a.childCount).toBe(children.length);
+    }
+    const cluster = roots.assets.find((a) => a.kind === 'cluster' && a.name === CLUSTER)!;
+    expect(cluster.childCount).toBeGreaterThan(0);
+    const branch = await call<AssetList>(
+      'GET',
+      `/inventory/assets?projectId=${cluster.projectId}&parent=${encodeURIComponent(cluster.key)}&childCounts=true`,
+    );
+    expect(branch.total).toBe(cluster.childCount);
+    expect(branch.assets.every((a) => a.parentKey === cluster.key)).toBe(true);
+    expect(branch.assets.some((a) => (a.childCount ?? 0) > 0)).toBe(true);
+    // Without childCounts there are none.
+    const plain = await call<AssetList>('GET', '/inventory/assets?roots=true');
+    expect(plain.assets.every((a) => a.childCount === undefined)).toBe(true);
+  });
+
+  it('adds the ancestors of the matches that are not among them', async () => {
+    const list = await call<AssetList>(
+      'GET',
+      '/inventory/assets?kind=container&q=checkout&limit=3&ancestors=true',
+    );
+    expect(list.assets).toHaveLength(3);
+    const ancestors = list.ancestors ?? [];
+    const page = new Set(ids(list.assets));
+    expect(ancestors.every((a) => !page.has(a.id))).toBe(true);
+    expect(new Set(ids(ancestors)).size).toBe(ancestors.length);
+    // Every match reaches the top through the ancestors.
+    const byKey = new Map(ancestors.map((a) => [a.key, a]));
+    for (const container of list.assets) {
+      const chain: string[] = [];
+      for (let key = container.parentKey; key; key = byKey.get(key)?.parentKey ?? '') {
+        const parent = byKey.get(key);
+        expect(parent, key).toBeDefined();
+        chain.push(parent!.kind);
+      }
+      expect(chain).toEqual(['pod', 'workload', 'namespace', 'cluster']);
+    }
+    const without = await call<AssetList>('GET', '/inventory/assets?kind=container&limit=3');
+    expect(without.ancestors).toBeUndefined();
+    // Roots have none to add.
+    const roots = await call<AssetList>('GET', '/inventory/assets?roots=true&ancestors=true');
+    expect(roots.ancestors).toBeUndefined();
+  });
+});
+
+describe('inventory summary and changes (v1.2.2 fields)', () => {
+  it('counts live assets, regions and clusters', async () => {
+    const summary = await call<InventorySummary>('GET', '/inventory/summary');
+    const all = (await call<AssetList>('GET', '/inventory/assets?limit=5000')).assets;
+    const live = all.filter((a) => a.state !== 'terminated');
+    const total = (counts?: Partial<Record<string, number>>) =>
+      Object.values(counts ?? {}).reduce<number>((sum, n) => sum + (n ?? 0), 0);
+    expect(total(summary.live)).toBe(live.length);
+    expect(summary.live?.critical ?? 0).toBe(live.filter((a) => a.health === 'critical').length);
+    for (const project of summary.projects) {
+      expect(total(project.live)).toBe(live.filter((a) => a.projectId === project.id).length);
+    }
+
+    const regions = summary.regions ?? [];
+    const counted = live.filter(
+      (a) => a.attributes.cloud_region && a.kind !== 'pod' && a.kind !== 'container',
+    );
+    expect(regions.reduce((sum, r) => sum + r.assets, 0)).toBe(counted.length);
+    expect(regions[0]).toMatchObject({ provider: 'aws', region: REGION });
+    expect(regions.find((r) => r.region === AZURE_REGION)).toMatchObject({
+      provider: 'azure',
+      projects: [STAGING_PROJECT_NAME],
+    });
+    for (let i = 1; i < regions.length; i++) {
+      expect(regions[i - 1].assets).toBeGreaterThanOrEqual(regions[i].assets);
+    }
+    for (const r of regions) {
+      expect(r.warning + r.critical).toBeLessThanOrEqual(r.assets);
+      expect(r.projects).toEqual([...r.projects].sort());
+    }
+
+    expect(summary.clusters).toEqual(expect.arrayContaining([CLUSTER, 'analytics-aks']));
+    expect(summary.clusters).toEqual([...(summary.clusters ?? [])].sort());
+
+    const staging = await call<InventorySummary>(
+      'GET',
+      `/inventory/summary?projectId=${STAGING_PROJECT_ID}`,
+    );
+    expect(staging.projects.map((p) => p.id)).toEqual([STAGING_PROJECT_ID]);
+    expect(staging.regions?.every((r) => r.projects.join() === STAGING_PROJECT_NAME)).toBe(true);
+  });
+
+  it('gives a change its asset id while the asset is still listed', async () => {
+    const all = (await call<AssetList>('GET', '/inventory/assets?limit=5000')).assets;
+    const byKey = new Map(all.map((a) => [`${a.projectId}|${a.key}`, a.id]));
+    const changes = await call<AssetChange[]>('GET', '/inventory/changes?hours=168&limit=500');
+    expect(changes.some((c) => c.assetId)).toBe(true);
+    for (const c of changes) {
+      expect(c.assetId, c.assetName).toBe(byKey.get(`${c.projectId}|${c.assetKey}`));
+    }
   });
 });
 

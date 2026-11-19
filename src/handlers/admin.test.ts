@@ -247,6 +247,55 @@ describe('demo admin area', () => {
     expect(JSON.stringify(created2)).not.toContain('clientSecret');
     await rejects(call(router, 'POST', '/auth/sso/callback', {}), 403);
   });
+
+  it('SSO connectors: provider MFA trust as mfaTrust, or the legacy trustIdpMfa', async () => {
+    const [seeded] = (await call<{ connectors: SSOConnector[] }>(router, 'GET', '/sso/connectors'))
+      .connectors;
+    expect(seeded).toMatchObject({ mfaTrust: 'amr', trustIdpMfa: true });
+    const request = {
+      name: 'Fabrikam SSO',
+      providerType: 'okta',
+      issuerUrl: 'https://fabrikam.example.com',
+      clientId: 'abc',
+      clientSecret: 'x',
+      scopes: '',
+      groupsClaim: '',
+      requireVerifiedEmail: true,
+      buttonLabel: '',
+      enabled: true,
+    };
+    const create = (extra: object) =>
+      call<SSOConnector>(router, 'POST', '/sso/connectors', { ...request, ...extra });
+    // Neither sent: off.
+    expect(await create({})).toMatchObject({ mfaTrust: 'off', trustIdpMfa: false });
+    // Legacy true on create: amr; mfaTrust wins over it.
+    expect(await create({ trustIdpMfa: true })).toMatchObject({ mfaTrust: 'amr' });
+    const always = await create({ mfaTrust: 'always', trustIdpMfa: false });
+    expect(always).toMatchObject({ mfaTrust: 'always', trustIdpMfa: true });
+    await expect(create({ mfaTrust: 'sometimes' })).rejects.toMatchObject({
+      status: 400,
+      message: 'invalid mfaTrust: must be "off", "amr" or "always"',
+    });
+
+    const update = (extra: object) =>
+      call<SSOConnector>(router, 'PUT', `/sso/connectors/${always.id}`, { ...request, ...extra });
+    // Neither sent keeps it; a legacy true keeps always; false turns it off; then true is amr.
+    expect(await update({})).toMatchObject({ mfaTrust: 'always' });
+    expect(await update({ trustIdpMfa: true })).toMatchObject({ mfaTrust: 'always' });
+    expect(await update({ trustIdpMfa: false })).toMatchObject({
+      mfaTrust: 'off',
+      trustIdpMfa: false,
+    });
+    expect(await update({ trustIdpMfa: true })).toMatchObject({ mfaTrust: 'amr' });
+    expect(await update({ mfaTrust: 'always' })).toMatchObject({ mfaTrust: 'always' });
+    await rejects(update({ mfaTrust: 'ALWAYS' }), 400);
+    expect((await update({})).mfaTrust).toBe('always');
+
+    const log = await call<GetAuditLogsResponse>(router, 'GET', '/audit-logs/global?limit=20');
+    expect(log.auditLogs.map((l) => l.message)).toContain(
+      'SSO connector Fabrikam SSO: provider MFA trust changed from amr to always',
+    );
+  });
 });
 
 describe('demo central notification settings', () => {

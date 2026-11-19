@@ -11,6 +11,7 @@ import type {
   OAuthConnectedApp,
   SSOConnector,
   SSOGroupMapping,
+  SSOMFATrust,
   UpdateSSOConnectorRequest,
   UserPlan,
   UserProfile,
@@ -383,6 +384,7 @@ const ssoConnectors = collection<SSORecord>('ssoConnectors', () => [
     scopes: 'openid email profile groups',
     groupsClaim: 'groups',
     requireVerifiedEmail: true,
+    mfaTrust: 'amr',
     trustIdpMfa: true,
     buttonLabel: 'Sign in with Harborline Identity',
     enabled: true,
@@ -391,11 +393,39 @@ const ssoConnectors = collection<SSORecord>('ssoConnectors', () => [
   },
 ]);
 
-const toConnector = (c: SSORecord): SSOConnector => ({
-  ...c,
-  createdAt: isoOf(c.createdAt),
-  updatedAt: isoOf(c.updatedAt),
-});
+/** A record's mode; ones saved before v1.2.2 only kept trustIdpMfa. */
+const mfaTrustOf = (c: SSORecord): SSOMFATrust => c.mfaTrust ?? (c.trustIdpMfa ? 'amr' : 'off');
+
+const toConnector = (c: SSORecord): SSOConnector => {
+  const mfaTrust = mfaTrustOf(c);
+  return {
+    ...c,
+    mfaTrust,
+    trustIdpMfa: mfaTrust !== 'off',
+    createdAt: isoOf(c.createdAt),
+    updatedAt: isoOf(c.updatedAt),
+  };
+};
+
+const MFA_TRUST: SSOMFATrust[] = ['off', 'amr', 'always'];
+
+/**
+ * A request's mfaTrust, or the deprecated trustIdpMfa when it is omitted (true = amr, or keeps a
+ * current always; false = off); undefined when neither was sent. Like the Site's requestedMFATrust.
+ */
+function requestedMFATrust(
+  b: { mfaTrust?: unknown; trustIdpMfa?: unknown },
+  current: SSOMFATrust = 'off',
+): SSOMFATrust | undefined {
+  if (b.mfaTrust !== undefined && b.mfaTrust !== null) {
+    if (!MFA_TRUST.includes(b.mfaTrust as SSOMFATrust))
+      throw new DemoError(400, 'invalid mfaTrust: must be "off", "amr" or "always"');
+    return b.mfaTrust as SSOMFATrust;
+  }
+  if (b.trustIdpMfa === undefined || b.trustIdpMfa === null) return undefined;
+  if (!b.trustIdpMfa) return 'off';
+  return current === 'always' ? 'always' : 'amr';
+}
 
 type MappingRecord = Omit<SSOGroupMapping, 'createdAt'> & { createdAt: When };
 
@@ -427,7 +457,11 @@ const ssoMappings = collection<MappingRecord>('ssoGroupMappings', () => [
 ]);
 
 function connectorFields(body: unknown, existing?: SSORecord) {
-  const b = (body ?? {}) as Partial<CreateSSOConnectorRequest & UpdateSSOConnectorRequest>;
+  const b = (body ?? {}) as Partial<CreateSSOConnectorRequest & UpdateSSOConnectorRequest> & {
+    trustIdpMfa?: boolean;
+  };
+  const current = existing ? mfaTrustOf(existing) : 'off';
+  const mfaTrust = requestedMFATrust(b, current) ?? current;
   const name = (b.name ?? '').trim();
   if (!name) throw new DemoError(400, 'name is required');
   const issuerUrl = (b.issuerUrl ?? '').trim();
@@ -445,7 +479,8 @@ function connectorFields(body: unknown, existing?: SSORecord) {
     scopes: b.scopes?.trim() || 'openid email profile',
     groupsClaim: b.groupsClaim?.trim() ?? '',
     requireVerifiedEmail: b.requireVerifiedEmail ?? true,
-    trustIdpMfa: !!b.trustIdpMfa,
+    mfaTrust,
+    trustIdpMfa: mfaTrust !== 'off',
     buttonLabel: b.buttonLabel?.trim() || `Sign in with ${name}`,
     enabled: b.enabled ?? true,
   };
@@ -762,7 +797,9 @@ function registerIdentity(r: Router) {
       createdAt: now,
       updatedAt: now,
     });
-    recordAudit(`SSO connector created: ${connector.name} (${connector.providerType})`);
+    recordAudit(
+      `SSO connector created: ${connector.name} (${connector.providerType}), provider MFA trust: ${mfaTrustOf(connector)}`,
+    );
     return toConnector(connector);
   });
   r.put('/sso/connectors/:connectorId', (req) => {
@@ -772,6 +809,12 @@ function registerIdentity(r: Router) {
       updatedAt: Date.now(),
     }) as SSORecord;
     recordAudit(`SSO connector updated: ${updated.name} (${updated.providerType})`);
+    // Decides who skips Obzly's MFA, so it gets its own entry.
+    const [before, after] = [mfaTrustOf(existing), mfaTrustOf(updated)];
+    if (before !== after)
+      recordAudit(
+        `SSO connector ${updated.name}: provider MFA trust changed from ${before} to ${after}`,
+      );
     return toConnector(updated);
   });
   r.delete('/sso/connectors/:connectorId', (req) => {
