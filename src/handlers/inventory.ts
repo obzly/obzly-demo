@@ -14,15 +14,18 @@ import type {
 } from '../../entity/cloud';
 import type {
   Asset,
+  AssetChange,
   AssetDetail,
   AssetHealth,
   AssetKind,
+  AssetList,
   InventoryHistory,
   InventorySummary,
 } from '../../entity/inventory';
 import {
   changesBetween,
   inventoryAssets,
+  isAssetSort,
   lastHealthScan,
   refOf,
   sortAssets,
@@ -111,7 +114,12 @@ function historyOf(summary: InventorySummary, now = Date.now()): InventoryHistor
   };
 }
 
-function filtered(req: DemoRequest): Asset[] {
+/** Whether an attribute value (not key) contains needle, already lower case. */
+const inAttributes = (a: Asset, needle: string) =>
+  Object.values(a.attributes).some((value) => value.toLowerCase().includes(needle));
+
+/** The assets matching the list's filters, like the Site's listAssets. */
+function filtered(req: DemoRequest, all = inventoryAssets()): Asset[] {
   const q = req.query;
   const projectId = q.get('projectId') ?? '';
   const kinds = list(q.get('kind'));
@@ -119,8 +127,12 @@ function filtered(req: DemoRequest): Asset[] {
   const states = list(q.get('state'));
   const cluster = q.get('cluster') ?? '';
   const namespace = q.get('namespace') ?? '';
+  const parent = q.get('parent') ?? '';
+  const roots = q.get('roots') === 'true';
   const search = (q.get('q') ?? '').trim().toLowerCase();
-  return inventoryAssets().filter(
+  // An asset whose parent isn't in the inventory (any more) is a root too.
+  const present = new Set(all.map((a) => `${a.projectId}|${a.key}`));
+  return all.filter(
     (a) =>
       (!projectId || a.projectId === projectId) &&
       (!kinds.length || kinds.includes(a.kind)) &&
@@ -128,10 +140,13 @@ function filtered(req: DemoRequest): Asset[] {
       (!states.length || states.includes(a.state)) &&
       (!cluster || a.cluster === cluster) &&
       (!namespace || a.namespace === namespace) &&
+      (!parent || a.parentKey === parent) &&
+      (!roots || !a.parentKey || !present.has(`${a.projectId}|${a.parentKey}`)) &&
       (!search ||
         a.name.toLowerCase().includes(search) ||
         a.node.toLowerCase().includes(search) ||
-        JSON.stringify(a.attributes).toLowerCase().includes(search)),
+        a.projectName.toLowerCase().includes(search) ||
+        inAttributes(a, search)),
   );
 }
 
@@ -139,6 +154,79 @@ const clamp = (value: string | null, fallback: number, max: number) => {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.min(n, max) : fallback;
 };
+
+/** A whole number like Go's strconv.Atoi, 0 when it isn't one. */
+const intParam = (value: string | null) => (/^[+-]?\d+$/.test(value ?? '') ? Number(value) : 0);
+
+/** The parents, up to the top (6 levels, like the Site), of assets that aren't among them. */
+function ancestorsOf(page: Asset[], all: Asset[]): Asset[] {
+  const byKey = new Map(all.map((a) => [`${a.projectId}|${a.key}`, a]));
+  const have = new Set(page.map((a) => `${a.projectId}|${a.key}`));
+  const result: Asset[] = [];
+  let level = page;
+  for (let steps = 0; steps < 6 && level.length > 0; steps++) {
+    const next: Asset[] = [];
+    for (const a of level) {
+      const id = `${a.projectId}|${a.parentKey}`;
+      const parent = a.parentKey ? byKey.get(id) : undefined;
+      if (!parent || have.has(id)) continue;
+      have.add(id);
+      next.push(parent);
+    }
+    result.push(...next);
+    level = next;
+  }
+  return result;
+}
+
+/** GET /inventory/assets: a page of the matches in the asked order, and how many matched. */
+function assetList(req: DemoRequest): AssetList {
+  const q = req.query;
+  const order = (q.get('order') ?? '').trim();
+  if (order && order !== 'asc' && order !== 'desc') bad('order must be asc or desc');
+  const sort = (q.get('sort') ?? '').trim() || 'health';
+  if (!isAssetSort(sort)) return bad(`invalid request: unknown sort "${sort}"`);
+  const asked = intParam(q.get('limit'));
+  const limit = asked > 0 ? Math.min(asked, 5000) : 2000;
+  const offset = Math.max(intParam(q.get('offset')), 0);
+  const all = inventoryAssets();
+  const matches = sortAssets(filtered(req, all), sort, order === 'desc');
+  let assets: Asset[] = matches.slice(offset, offset + limit);
+  if (q.get('childCounts') === 'true') {
+    const children = new Map<string, number>();
+    for (const a of all) {
+      if (!a.parentKey) continue;
+      const id = `${a.projectId}|${a.parentKey}`;
+      children.set(id, (children.get(id) ?? 0) + 1);
+    }
+    assets = assets.map((a) => ({
+      ...a,
+      childCount: children.get(`${a.projectId}|${a.key}`) ?? 0,
+    }));
+  }
+  const result: AssetList = { assets, total: matches.length };
+  if (q.get('ancestors') === 'true') {
+    const ancestors = ancestorsOf(assets, all);
+    if (ancestors.length) result.ancestors = ancestors;
+  }
+  return result;
+}
+
+/** GET /inventory/changes: newest first, with the asset's id while it is still listed. */
+function changeList(req: DemoRequest): AssetChange[] {
+  const hours = clamp(req.query.get('hours'), 24, 168);
+  const limit = clamp(req.query.get('limit'), 100, 500);
+  const projectId = req.query.get('projectId') ?? '';
+  const now = Date.now();
+  const ids = new Map(inventoryAssets(now).map((a) => [`${a.projectId}|${a.key}`, a.id]));
+  return changesBetween(now - hours * HOUR, now, now)
+    .filter((c) => !projectId || c.projectId === projectId)
+    .slice(0, limit)
+    .map((c) => {
+      const assetId = ids.get(`${c.projectId}|${c.assetKey}`);
+      return assetId ? { ...c, assetId } : c;
+    });
+}
 
 function assetDetail(id: string): AssetDetail {
   const all = inventoryAssets();
@@ -563,26 +651,18 @@ const body = <T>(req: DemoRequest) => (req.body ?? {}) as T;
 export function register(r: Router) {
   // The inventory (a Site's; a control plane reads it through /sites/:id, any id here).
   r.get('/inventory/summary', (req) => {
-    const summary = summarize(filtered(req));
+    // The summary reads every asset of the user's projects, or of projectId.
+    const projectId = req.query.get('projectId') ?? '';
+    const summary = summarize(
+      inventoryAssets().filter((a) => !projectId || a.projectId === projectId),
+    );
     return req.query.get('history') === 'true'
       ? { ...summary, history: historyOf(summary) }
       : summary;
   });
-  r.get('/inventory/assets', (req) => {
-    const assets = sortAssets(filtered(req));
-    const limit = clamp(req.query.get('limit'), 2000, 5000);
-    return { assets: assets.slice(0, limit), total: assets.length };
-  });
+  r.get('/inventory/assets', assetList);
   r.get('/inventory/assets/:id', (req) => assetDetail(req.params.id));
-  r.get('/inventory/changes', (req) => {
-    const hours = clamp(req.query.get('hours'), 24, 168);
-    const limit = clamp(req.query.get('limit'), 100, 500);
-    const projectId = req.query.get('projectId') ?? '';
-    const now = Date.now();
-    return changesBetween(now - hours * HOUR, now, now)
-      .filter((c) => !projectId || c.projectId === projectId)
-      .slice(0, limit);
-  });
+  r.get('/inventory/changes', changeList);
 
   // Cloud connections (control plane).
   r.get('/cloud-connections', () => {

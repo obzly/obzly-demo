@@ -13,8 +13,10 @@ import type {
   AssetMetrics,
   AssetReason,
   AssetRef,
+  AssetSort,
   AssetState,
   InventorySummary,
+  RegionCount,
 } from '../../entity/inventory';
 import { projects } from '../handlers/bootstrap';
 import { hashString, mix, rng, uuidFrom } from '../lib/rng';
@@ -801,34 +803,136 @@ const HEALTH_ORDER: Record<AssetHealth, number> = {
   inactive: 4,
 };
 
-/** Worst health first, then kind and name, like the Site's query. */
-export function sortAssets(assets: Asset[]): Asset[] {
-  return [...assets].sort(
-    (a, b) =>
-      HEALTH_ORDER[a.health] - HEALTH_ORDER[b.health] ||
-      a.kind.localeCompare(b.kind) ||
-      a.name.localeCompare(b.name),
-  );
+/** The kind filters' hierarchy order, like the Site's kindOrderSQL. */
+const KIND_ORDER: Record<AssetKind, number> = {
+  cluster: 0,
+  node: 1,
+  host: 2,
+  namespace: 3,
+  workload: 4,
+  pod: 5,
+  container: 6,
+  docker_container: 7,
+  service: 8,
+  load_balancer: 9,
+  database: 10,
+  bucket: 11,
+  function: 12,
+  scaling_group: 13,
+};
+
+/** Leaves before the parents repeating their reason, like the Site's leafOrderSQL. */
+const LEAF_ORDER: Partial<Record<AssetKind, number>> = {
+  pod: 0,
+  container: 1,
+  node: 2,
+  host: 3,
+  docker_container: 4,
+  workload: 5,
+  service: 6,
+};
+
+type SortKey = (a: Asset) => number | string;
+
+/** Each sort's keys before name and id, ascending; a missing metric is -1 (the Site's sortKeys). */
+const SORT_KEYS: Record<AssetSort, SortKey[]> = {
+  health: [(a) => HEALTH_ORDER[a.health] ?? 4],
+  kind: [(a) => KIND_ORDER[a.kind] ?? 99],
+  name: [],
+  cpu: [(a) => a.metrics.cpuPercent ?? -1],
+  memory: [(a) => a.metrics.memoryPercent ?? -1],
+  restarts: [(a) => a.metrics.restarts24h ?? -1],
+  // Ascending is the newest and the most recently seen first.
+  age: [(a) => -Date.parse(a.firstSeen)],
+  lastSeen: [(a) => -Date.parse(a.lastSeen)],
+  attention: [(a) => HEALTH_ORDER[a.health] ?? 4, (a) => LEAF_ORDER[a.kind] ?? 9],
+};
+
+export const isAssetSort = (sort: string): sort is AssetSort =>
+  Object.prototype.hasOwnProperty.call(SORT_KEYS, sort);
+
+// Bytewise, like the Site's name COLLATE "C" (and its uuid order for ids).
+const compareValues = (a: number | string, b: number | string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * Sorted like the Site's query: ascending is worst health, newest or least first; descending
+ * reverses every key, name and id included.
+ */
+export function sortAssets(
+  assets: Asset[],
+  sort: AssetSort = 'health',
+  descending = false,
+): Asset[] {
+  const keys: SortKey[] = [...SORT_KEYS[sort], (a) => a.name, (a) => a.id];
+  const sign = descending ? -1 : 1;
+  return [...assets].sort((a, b) => {
+    for (const key of keys) {
+      const result = compareValues(key(a), key(b));
+      if (result !== 0) return result * sign;
+    }
+    return 0;
+  });
 }
 
+const count = <K extends string>(counts: Partial<Record<K, number>>, key: K) => {
+  counts[key] = (counts[key] ?? 0) + 1;
+};
+
+/**
+ * Counts by kind, health, state and project, the live (not terminated) ones by health, the
+ * regions of live assets other than pods and containers, and the cluster names.
+ */
 export function summarize(assets: Asset[]): InventorySummary {
   const summary: InventorySummary = { total: 0, kinds: {}, health: {}, states: {}, projects: [] };
-  const perProject = new Map<string, { id: string; name: string; assets: number }>();
+  const live: Partial<Record<AssetHealth, number>> = {};
+  const perProject = new Map<string, InventorySummary['projects'][number]>();
+  const regions = new Map<string, RegionCount>();
+  const clusters = new Set<string>();
   for (const a of assets) {
     summary.total++;
-    const kind = (summary.kinds[a.kind] ??= {});
-    kind[a.health] = (kind[a.health] ?? 0) + 1;
-    summary.health[a.health] = (summary.health[a.health] ?? 0) + 1;
-    summary.states[a.state] = (summary.states[a.state] ?? 0) + 1;
+    count((summary.kinds[a.kind] ??= {}), a.health);
+    count(summary.health, a.health);
+    count(summary.states, a.state);
     const project = perProject.get(a.projectId) ?? {
       id: a.projectId,
       name: a.projectName,
       assets: 0,
+      live: {},
     };
     project.assets++;
     perProject.set(a.projectId, project);
+    if (a.kind === 'cluster') clusters.add(a.cluster);
+    if (a.state === 'terminated') continue;
+    count(live, a.health);
+    count(project.live!, a.health);
+    const region = a.attributes.cloud_region ?? '';
+    if (!region || a.kind === 'pod' || a.kind === 'container') continue;
+    const provider = a.attributes.cloud_provider ?? '';
+    const id = `${provider} ${region}`;
+    const row = regions.get(id) ?? {
+      provider,
+      region,
+      assets: 0,
+      warning: 0,
+      critical: 0,
+      projects: [],
+    };
+    row.assets++;
+    if (a.health === 'warning') row.warning++;
+    if (a.health === 'critical') row.critical++;
+    if (!row.projects.includes(a.projectName)) row.projects.push(a.projectName);
+    regions.set(id, row);
   }
   summary.projects = [...perProject.values()];
+  summary.live = live;
+  summary.regions = [...regions.values()]
+    .map((row) => ({ ...row, projects: row.projects.sort(compareValues) }))
+    .sort(
+      (a, b) =>
+        b.assets - a.assets ||
+        compareValues(`${a.provider} ${a.region}`, `${b.provider} ${b.region}`),
+    );
+  summary.clusters = [...clusters].sort(compareValues);
   return summary;
 }
 
